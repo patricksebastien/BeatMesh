@@ -1,0 +1,36 @@
+dependencies:
+  espressif/asio:
+    component_hash: 74ffc1f514826d3092168a9a259b20810349f6e68023480636ea7f2af0be524c
+    dependencies:
+    - name: espressif/sock_utils
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^0.1
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.32.0
+  espressif/sock_utils:
+    component_hash: 8188e758451f5cdf2b8d11205237986dd85760662f325132d1cd173fc081c988
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.1.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.0
+direct_dependencies:
+- espressif/asio
+- espressif/sock_utils
+- idf
+manifest_hash: 5f5c6dc869bd9a39fe6ad31b345be49abd3366e24204c85df887787700399ac2
+target: esp32
+version: 2.0.0
