@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -12,6 +13,8 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gptimer.h"
+#include "esp_timer.h"
+#include "driver/ledc.h"
 #include "lwip/sockets.h"
 #include "abl_link.h"
 #include "esp_private/esp_clk.h"
@@ -88,6 +91,15 @@ static char s_ssid_name[33] = {0};
 #define C_VINTAGE_FERN    tft->color565(109, 151, 115)
 #define C_VINTAGE_CREAM_DIM tft->color565(122, 128, 121)
 #define C_VINTAGE_AMBER   tft->color565(195, 110, 45)
+#define C_VINTAGE_BG_LT   tft->color565(55, 95, 108)
+
+// --- Mode/PPQN button layout (y=100, h=40) ---
+static const int mode_btn_x[] = { 10, 86, 162, 238 };
+static const int mode_btn_w[] = { 71, 71, 71, 72 };
+static const int ppqn_btn_x[] = { 206, 242, 278 };
+static const int ppqn_btn_w[] = { 32, 32, 32 };
+static const char *mode_labels[] = { "LINK", "MIDI", "THR", "CV" };
+static const char *ppqn_labels[] = { "1", "4", "24" };
 
 typedef struct { 
     abl_link link; 
@@ -95,8 +107,17 @@ typedef struct {
 } link_state_t;
 
 static link_state_t g_link_state;
-enum midi_mode_t { MODE_LINK = 0, MODE_MIDI_CLK = 1, MODE_MIDI_THRU = 2 };
+enum midi_mode_t { MODE_LINK = 0, MODE_MIDI_CLK = 1, MODE_MIDI_THRU = 2, MODE_CV = 3, MODE_COUNT = 4 };
 static volatile int midi_mode = MODE_LINK;
+
+// Shared PPQN setting for CV in/out (1, 4, or 24)
+static volatile int cv_ppqn = 4;
+static const int cv_ppqn_options[] = { 1, 4, 24 };
+static volatile int cv_ppqn_idx = 1; // index into cv_ppqn_options (default: 4 PPQN)
+
+// Metronome (LEDC PWM on GPIO 26 → onboard amp/speaker)
+static volatile bool metronome_enabled = false;
+#define METRO_PIN GPIO_NUM_26
 
 // --- MIDI Clock (UART2 on CYD CN1 connector) ---
 #define MIDI_UART       UART_NUM_2
@@ -105,7 +126,80 @@ static volatile int midi_mode = MODE_LINK;
 #define MIDI_BAUD       31250
 #define MIDI_TICK_PERIOD 100  // Timer period in microseconds (10kHz polling)
 
-static uint8_t midi_out_byte;
+// --- CV Clock input (GPIO35, input-only pin) ---
+#define CV_CLK_PIN      GPIO_NUM_35
+
+static volatile int32_t cv_interval_us = 0;  // atomic on 32-bit MCU
+static TaskHandle_t cv_task_handle = NULL;
+
+static void IRAM_ATTR cv_clock_isr(void *arg) {
+    static int64_t last_edge = 0;  // ISR-local, no torn-read risk
+    int64_t now = esp_timer_get_time();
+    int64_t delta = now - last_edge;
+    last_edge = now;
+    if (delta > 0 && delta < INT32_MAX)
+        cv_interval_us = (int32_t)delta;  // atomic 32-bit write
+    BaseType_t wake = pdFALSE;
+    if (cv_task_handle)
+        vTaskNotifyGiveFromISR(cv_task_handle, &wake);
+    if (wake) portYIELD_FROM_ISR();
+}
+
+static void cv_clock_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << CV_CLK_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(CV_CLK_PIN, cv_clock_isr, NULL);
+}
+
+// --- CV Clock output (Link → CV gates/triggers, always active) ---
+// Dedicated pins from SD card connector (no conflicts)
+#define CV_OUT_CLK_PIN      GPIO_NUM_19  // CV Clock (not a strapping pin)
+#define CV_OUT_RESET_PIN    GPIO_NUM_23  // SD_MOSI → CV Reset
+#define CV_OUT_RUN_PIN      GPIO_NUM_18  // SD_SCK  → CV Play/Stop
+#define CV_PULSE_WIDTH_US   5000         // 5ms trigger pulse
+
+static void cv_out_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << CV_OUT_CLK_PIN) | (1ULL << CV_OUT_RESET_PIN) | (1ULL << CV_OUT_RUN_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(CV_OUT_CLK_PIN, 0);
+    gpio_set_level(CV_OUT_RESET_PIN, 0);
+    gpio_set_level(CV_OUT_RUN_PIN, 0);
+}
+
+static void metronome_init(void) {
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 1200,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&timer_cfg);
+
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num = METRO_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&ch_cfg);
+}
 
 static void midi_init(void) {
     uart_config_t uart_cfg = {
@@ -119,21 +213,29 @@ static void midi_init(void) {
     uart_param_config(MIDI_UART, &uart_cfg);
     uart_set_pin(MIDI_UART, MIDI_TX_PIN, MIDI_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(MIDI_UART, 512, 256, 0, NULL, 0);
+    // Default RXFIFO threshold is 120 bytes = ~38ms of silence before ISR fires at MIDI baud.
+    // Set to 1 so the ISR fires on the very first byte (~us wakeup).
+    uart_set_rx_full_threshold(MIDI_UART, 1);
 }
 
 static void midi_send_tick(void) {
-    midi_out_byte = 0xF8;
-    uart_write_bytes(MIDI_UART, (const char *)&midi_out_byte, 1);
+    const uint8_t b = 0xF8;
+    uart_write_bytes(MIDI_UART, (const char *)&b, 1);
 }
 
 static void midi_send_start(void) {
-    midi_out_byte = 0xFA;
-    uart_write_bytes(MIDI_UART, (const char *)&midi_out_byte, 1);
+    const uint8_t b = 0xFA;
+    uart_write_bytes(MIDI_UART, (const char *)&b, 1);
 }
 
 static void midi_send_stop(void) {
-    midi_out_byte = 0xFC;
-    uart_write_bytes(MIDI_UART, (const char *)&midi_out_byte, 1);
+    const uint8_t b = 0xFC;
+    uart_write_bytes(MIDI_UART, (const char *)&b, 1);
+}
+
+static void midi_send_continue(void) {
+    const uint8_t b = 0xFB;
+    uart_write_bytes(MIDI_UART, (const char *)&b, 1);
 }
 
 // Timer ISR: notify MIDI task every 100us
@@ -150,10 +252,12 @@ static void midi_clock_task(void *param) {
     // Own session state to avoid races with visual_task
     abl_link_session_state midi_ss = abl_link_create_session_state();
 
-    // Initialize tick counter to current position (avoid burst on start)
+    // Initialize tick counters to current position (avoid burst on start)
     abl_link_capture_audio_session_state(s->link, midi_ss);
     uint64_t now = abl_link_clock_micros(s->link);
-    int last_ticks = (int)floor(abl_link_beat_at_time(midi_ss, now, 1.0) * 24.0);
+    double beat0 = abl_link_beat_at_time(midi_ss, now, 1.0);
+    int last_midi_ticks = (int)floor(beat0 * 24.0);
+    int last_cv_ticks = (int)floor(beat0 * (double)cv_ppqn);
     bool last_playing = abl_link_is_playing(midi_ss);
 
     // Setup gptimer: 1MHz resolution, 100us alarm period
@@ -179,25 +283,78 @@ static void midi_clock_task(void *param) {
     gptimer_enable(timer);
     gptimer_start(timer);
 
-    bool was_active = true; // Start as if active to avoid re-sync on first loop
+    bool midi_was_active = true;
+
+    // CV out pulse end timestamps (0 = no active pulse)
+    int64_t cv_clk_pulse_end = 0;
+    int64_t cv_reset_pulse_end = 0;
+    bool cv_last_playing = last_playing;
+    int cached_cv_ppqn = cv_ppqn;  // track ppqn changes to re-snap ticks
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        if (midi_mode != MODE_LINK) {
-            was_active = false;
-            continue;
-        }
-
         abl_link_capture_audio_session_state(s->link, midi_ss);
         now = abl_link_clock_micros(s->link);
         bool playing = abl_link_is_playing(midi_ss);
+        double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
+        int64_t now_us = (int64_t)esp_timer_get_time();
 
-        // Re-sync after returning from MIDI mode to avoid spurious ticks/start/stop
-        if (!was_active) {
+        // ---- CV OUT: always active, independent of mode ----
+
+        // Re-snap CV tick counter if PPQN changed (prevents freeze/burst)
+        int cur_ppqn = cv_ppqn;
+        if (cur_ppqn != cached_cv_ppqn) {
+            last_cv_ticks = (int)floor(beat * (double)cur_ppqn);
+            cached_cv_ppqn = cur_ppqn;
+        }
+
+        // End active pulses that exceeded their width
+        if (cv_clk_pulse_end && now_us >= cv_clk_pulse_end) {
+            gpio_set_level(CV_OUT_CLK_PIN, 0);
+            cv_clk_pulse_end = 0;
+        }
+        if (cv_reset_pulse_end && now_us >= cv_reset_pulse_end) {
+            gpio_set_level(CV_OUT_RESET_PIN, 0);
+            cv_reset_pulse_end = 0;
+        }
+
+        // Start/stop: run gate + reset trigger on start
+        if (playing && !cv_last_playing) {
+            gpio_set_level(CV_OUT_RUN_PIN, 1);
+            gpio_set_level(CV_OUT_RESET_PIN, 1);
+            cv_reset_pulse_end = now_us + CV_PULSE_WIDTH_US;
+            last_cv_ticks = (int)floor(beat * (double)cur_ppqn);
+        } else if (!playing && cv_last_playing) {
+            gpio_set_level(CV_OUT_RUN_PIN, 0);
+            gpio_set_level(CV_OUT_CLK_PIN, 0);
+            cv_clk_pulse_end = 0;
+        }
+        cv_last_playing = playing;
+
+        // Clock tick pulses (uses shared cv_ppqn setting)
+        if (playing) {
+            int ticks = (int)floor(beat * (double)cur_ppqn);
+            if (ticks > last_cv_ticks) {
+                gpio_set_level(CV_OUT_CLK_PIN, 1);
+                cv_clk_pulse_end = now_us + CV_PULSE_WIDTH_US;
+            }
+            last_cv_ticks = ticks;
+        }
+
+        // ---- MIDI OUT: active in LINK and CV modes ----
+        bool midi_active = (midi_mode == MODE_LINK || midi_mode == MODE_CV);
+
+        if (!midi_active) {
+            midi_was_active = false;
+            continue;
+        }
+
+        // Re-sync after returning from MIDI-in mode
+        if (!midi_was_active) {
             last_playing = playing;
-            last_ticks = (int)floor(abl_link_beat_at_time(midi_ss, now, 1.0) * 24.0);
-            was_active = true;
+            last_midi_ticks = (int)floor(beat * 24.0);
+            midi_was_active = true;
             continue;
         }
 
@@ -210,12 +367,11 @@ static void midi_clock_task(void *param) {
         last_playing = playing;
 
         if (playing) {
-            double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
             int ticks = (int)floor(beat * 24.0);
-            if (ticks > last_ticks) {
+            if (ticks > last_midi_ticks) {
                 midi_send_tick();
             }
-            last_ticks = ticks;
+            last_midi_ticks = ticks;
         }
     }
 }
@@ -225,21 +381,120 @@ static void midi_in_task(void *param) {
     link_state_t *s = (link_state_t *)param;
     abl_link_session_state midi_in_ss = abl_link_create_session_state();
 
-    uint8_t byte;
+    uint8_t buf[128];
     int tick_count = 0;
     int64_t first_tick_us = 0;
 
+    // CV clock state
+    cv_task_handle = xTaskGetCurrentTaskHandle();
+    bool cv_playing = false;
+
     while (true) {
         if (midi_mode == MODE_LINK) {
-            vTaskDelay(pdMS_TO_TICKS(100)); // Idle when Link is master
+            vTaskDelay(pdMS_TO_TICKS(100));
             tick_count = 0;
+            cv_playing = false;
             continue;
         }
+
+        // --- CV Clock input: edge-triggered BPM → Link ---
+        if (midi_mode == MODE_CV) {
+            int ppqn = cv_ppqn;
+
+            // Dynamic timeout: 2x last interval, or 2s if unknown
+            TickType_t timeout = (cv_interval_us > 0)
+                ? pdMS_TO_TICKS(cv_interval_us / 500 + 1)  // 2x interval in ms
+                : pdMS_TO_TICKS(2000);
+
+            if (ulTaskNotifyTake(pdTRUE, timeout)) {
+                // Pulse received - calculate BPM
+                int64_t interval = cv_interval_us;
+                if (interval > 0) {
+                    double bpm = 60000000.0 / ((double)interval * ppqn);
+                    if (bpm > 20.0 && bpm < 999.0) {
+                        abl_link_capture_app_session_state(s->link, midi_in_ss);
+                        abl_link_set_tempo(midi_in_ss, bpm, abl_link_clock_micros(s->link));
+                        if (!cv_playing) {
+                            abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+                            cv_playing = true;
+                        }
+                        abl_link_commit_app_session_state(s->link, midi_in_ss);
+                    }
+                }
+            } else {
+                // Timeout - clock stopped
+                if (cv_playing) {
+                    abl_link_capture_app_session_state(s->link, midi_in_ss);
+                    abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
+                    abl_link_commit_app_session_state(s->link, midi_in_ss);
+                    cv_playing = false;
+                }
+            }
+            continue;
+        }
+
+        // --- MIDI THRU: bulk forward first, parse after ---
+        if (midi_mode == MODE_MIDI_THRU) {
+            // With RXFIFO threshold=1, task wakes within µs of first byte arriving.
+            // Returns immediately with all available bytes (1-128). 10ms is only
+            // the idle timeout for mode-switch responsiveness when no MIDI flows.
+            int len = uart_read_bytes(MIDI_UART, buf, sizeof(buf), pdMS_TO_TICKS(10));
+            if (len <= 0) continue;
+
+            // Forward everything immediately - data hits TX before any processing
+            uart_write_bytes(MIDI_UART, (const char *)buf, len);
+
+            // Scan forwarded data for transport messages to keep Link in sync
+            for (int i = 0; i < len; i++) {
+                switch (buf[i]) {
+                case 0xF8:
+                    tick_count++;
+                    if (tick_count == 1) {
+                        first_tick_us = (int64_t)abl_link_clock_micros(s->link);
+                    } else if (tick_count >= 25) {
+                        int64_t now_us = (int64_t)abl_link_clock_micros(s->link);
+                        int64_t elapsed = now_us - first_tick_us;
+                        if (elapsed > 0) {
+                            double bpm = 60000000.0 / (double)elapsed;
+                            if (bpm > 20.0 && bpm < 999.0) {
+                                abl_link_capture_app_session_state(s->link, midi_in_ss);
+                                abl_link_set_tempo(midi_in_ss, bpm, (uint64_t)now_us);
+                                abl_link_commit_app_session_state(s->link, midi_in_ss);
+                            }
+                        }
+                        tick_count = 1;
+                        first_tick_us = now_us;
+                    }
+                    break;
+                case 0xFA:
+                    abl_link_capture_app_session_state(s->link, midi_in_ss);
+                    abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+                    abl_link_commit_app_session_state(s->link, midi_in_ss);
+                    tick_count = 0;
+                    break;
+                case 0xFB:
+                    abl_link_capture_app_session_state(s->link, midi_in_ss);
+                    abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+                    abl_link_commit_app_session_state(s->link, midi_in_ss);
+                    break;
+                case 0xFC:
+                    abl_link_capture_app_session_state(s->link, midi_in_ss);
+                    abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
+                    abl_link_commit_app_session_state(s->link, midi_in_ss);
+                    tick_count = 0;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // --- MIDI CLK: byte-by-byte, forward only clock/transport ---
+        uint8_t byte;
         int len = uart_read_bytes(MIDI_UART, &byte, 1, pdMS_TO_TICKS(20));
         if (len <= 0) continue;
 
         switch (byte) {
-        case 0xF8: // Clock tick - always forward + calculate BPM
+        case 0xF8: // Clock tick
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
             tick_count++;
             if (tick_count == 1) {
@@ -250,36 +505,50 @@ static void midi_in_task(void *param) {
                 if (elapsed > 0) {
                     double bpm = 60000000.0 / (double)elapsed;
                     if (bpm > 20.0 && bpm < 999.0) {
-                        abl_link_capture_audio_session_state(s->link, midi_in_ss);
+                        abl_link_capture_app_session_state(s->link, midi_in_ss);
                         abl_link_set_tempo(midi_in_ss, bpm, (uint64_t)now_us);
-                        abl_link_commit_audio_session_state(s->link, midi_in_ss);
+                        abl_link_commit_app_session_state(s->link, midi_in_ss);
                     }
                 }
                 tick_count = 1;
-                first_tick_us = (int64_t)abl_link_clock_micros(s->link);
+                first_tick_us = now_us;
             }
             break;
 
-        case 0xFA: // Start - always forward + set Link playing
+        case 0xFA: // Start
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
-            abl_link_capture_audio_session_state(s->link, midi_in_ss);
+            abl_link_capture_app_session_state(s->link, midi_in_ss);
             abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
-            abl_link_commit_audio_session_state(s->link, midi_in_ss);
+            abl_link_commit_app_session_state(s->link, midi_in_ss);
             tick_count = 0;
             break;
 
-        case 0xFC: // Stop - always forward + set Link stopped
+        case 0xFB: // Continue
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
-            abl_link_capture_audio_session_state(s->link, midi_in_ss);
+            abl_link_capture_app_session_state(s->link, midi_in_ss);
+            abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+            abl_link_commit_app_session_state(s->link, midi_in_ss);
+            break;
+
+        case 0xFC: // Stop
+            uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
+            abl_link_capture_app_session_state(s->link, midi_in_ss);
             abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
-            abl_link_commit_audio_session_state(s->link, midi_in_ss);
+            abl_link_commit_app_session_state(s->link, midi_in_ss);
             tick_count = 0;
             break;
 
-        default:
-            // MIDI THRU: forward everything. MIDI CLK: drop non-clock bytes.
-            if (midi_mode == MODE_MIDI_THRU)
-                uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
+        case 0xF2: { // Song Position Pointer (3 bytes)
+            uint8_t spp[3] = { byte, 0, 0 };
+            int r1 = uart_read_bytes(MIDI_UART, &spp[1], 1, pdMS_TO_TICKS(20));
+            int r2 = uart_read_bytes(MIDI_UART, &spp[2], 1, pdMS_TO_TICKS(20));
+            if (r1 > 0 && r2 > 0) {
+                uart_write_bytes(MIDI_UART, (const char *)spp, 3);
+            }
+            break;
+        }
+
+        default: // MIDI CLK: drop non-transport bytes
             break;
         }
     }
@@ -287,7 +556,7 @@ static void midi_in_task(void *param) {
 
 // --- DNS Hijacker (Optimized for low latency) ---
 static void dns_hijacker_task(void *pvParameters) {
-    char rx_buffer[128];
+    char rx_buffer[128 + 16];  // extra 16 bytes for appended DNS answer
     struct sockaddr_in dest_addr = {};
     dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     dest_addr.sin_family = AF_INET;
@@ -318,7 +587,7 @@ static void dns_hijacker_task(void *pvParameters) {
     while (1) {
         struct sockaddr_in src;
         socklen_t len = sizeof(src);
-        int r = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&src, &len);
+        int r = recvfrom(sock, rx_buffer, 128, 0, (struct sockaddr *)&src, &len);
 
         if (r > 12) {
             // Build minimal DNS response pointing to AP IP (192.168.4.1)
@@ -428,50 +697,129 @@ static esp_err_t save_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t set_mode_handler(httpd_req_t *req) {
+    char buf[128];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(buf, "mode", val, sizeof(val)) == ESP_OK) {
+            int m = atoi(val);
+            if (m >= 0 && m <= 3) midi_mode = m;
+        }
+        if (httpd_query_key_value(buf, "ppqn", val, sizeof(val)) == ESP_OK) {
+            int p = atoi(val);
+            if (p >= 0 && p <= 2) {
+                cv_ppqn_idx = p;
+                cv_ppqn = cv_ppqn_options[p];
+            }
+        }
+        if (httpd_query_key_value(buf, "metro", val, sizeof(val)) == ESP_OK) {
+            metronome_enabled = (atoi(val) != 0);
+            if (!metronome_enabled) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            }
+        }
+    }
+    return captive_portal_redirect(req);
+}
+
 static esp_err_t get_handler(httpd_req_t *req) {
     abl_link_capture_app_session_state(g_link_state.link, g_web_ss);
     double current_bpm = abl_link_tempo(g_web_ss);
     bool is_playing = abl_link_is_playing(g_web_ss);
+    size_t peers = abl_link_num_peers(g_link_state.link);
 
-    char html_buf[2560];
+    char html_buf[4352];
     const char* play_style = is_playing ? "border:2px solid #FFF;" : "";
     const char* stop_style = !is_playing ? "border:2px solid #FFF;" : "";
 
-    static const char *mode_names[] = { "LINK", "MIDI CLK", "MIDI THRU" };
-    const char *mode_label = mode_names[midi_mode];
-    bool midi_is_master = (midi_mode != MODE_LINK);
+    static const char *mode_names[] = { "LINK", "MIDI CLK", "MIDI THRU", "CV" };
+    int cur_mode = midi_mode;
+    bool midi_is_master = (cur_mode == MODE_MIDI_CLK || cur_mode == MODE_MIDI_THRU || cur_mode == MODE_CV);
     const char *disabled = midi_is_master ? " disabled" : "";
     const char *midi_banner = midi_is_master
         ? "<p style='background:#874F41;padding:10px;border-radius:8px;font-size:14px;margin-bottom:15px'>"
-          "External MIDI clock &mdash; controls disabled</p>"
+          "External clock &mdash; controls disabled</p>"
         : "";
+
+    // Pre-build mode buttons HTML
+    char mode_btns[512];
+    int mpos = 0;
+    for (int i = 0; i < 4; i++) {
+        const char *sel = (i == cur_mode) ? "background:#E64833;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+        mpos += snprintf(mode_btns + mpos, sizeof(mode_btns) - mpos,
+            "<a href='/set_mode?mode=%d' class='mbtn' style='%s'>%s</a>", i, sel, mode_names[i]);
+    }
+
+    // Pre-build PPQN buttons HTML
+    char ppqn_btns[384];
+    int ppos = 0;
+    int cur_ppqn_idx = cv_ppqn_idx;
+    static const char *ppqn_labels[] = { "1", "4", "24" };
+    for (int i = 0; i < 3; i++) {
+        const char *sel = (i == cur_ppqn_idx) ? "background:#E64833;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+        ppos += snprintf(ppqn_btns + ppos, sizeof(ppqn_btns) - ppos,
+            "<a href='/set_mode?ppqn=%d' class='mbtn' style='%s'>%s</a>", i, sel, ppqn_labels[i]);
+    }
+
+    // Metronome toggle button
+    char metro_btn[128];
+    bool cur_metro = metronome_enabled;
+    const char *metro_style = cur_metro ? "background:#6D9773;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+    snprintf(metro_btn, sizeof(metro_btn),
+        "<a href='/set_mode?metro=%d' class='mbtn' style='%s'>%s</a>", cur_metro ? 0 : 1, metro_style, cur_metro ? "ON" : "OFF");
+
+    // Connection status
+    char conn_str[64];
+    if (s_is_connected) {
+        snprintf(conn_str, sizeof(conn_str), "LINK: %s", s_ssid_name);
+    } else {
+        snprintf(conn_str, sizeof(conn_str), "AP Mode");
+    }
+
+    double bpm_minus = current_bpm - 1.0;
+    double bpm_plus = current_bpm + 1.0;
+    if (bpm_minus < 20.0) bpm_minus = 20.0;
+    if (bpm_plus > 999.0) bpm_plus = 999.0;
 
     snprintf(html_buf, sizeof(html_buf),
         "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0'>"
         "<title>BeatMesh</title>"
         "<style>"
-        "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#244855;color:#FBE9D0;margin:0;padding:20px;text-align:center}"
+        "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#2448555c;color:#FBE9D0;margin:0;padding:20px;text-align:center}"
         ".container{max-width:400px;margin:0 auto}"
         ".card{background:#2c5563;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 4px 10px rgba(0,0,0,0.5);border:1px solid #874F41}"
-        "h1{color:#E64833;margin:0 0 15px 0;font-size:26px;letter-spacing:1px}"
+        "h1{color:#6D9773;margin:0 0 5px 0;font-size:32px;letter-spacing:1px}"
         "h2{font-size:16px;color:#90AEAD;border-bottom:1px solid #874F41;padding-bottom:10px;margin-bottom:15px}"
-        "input{width:100%%;box-sizing:border-box;padding:15px;margin:8px 0 20px 0;background:#1e3b46;border:1px solid #90AEAD;color:#FBE9D0;border-radius:8px;font-size:18px}"
+        "input{width:100%%;box-sizing:border-box;padding:12px;margin:4px 0 8px 0;background:#1e3b46;border:1px solid #90AEAD;color:#FBE9D0;border-radius:8px;font-size:18px;text-align:center}"
         "input:focus{border-color:#E64833;outline:none}"
         ".btn{width:100%%;background:#E64833;color:#FBE9D0;font-weight:bold;border:none;padding:15px;border-radius:8px;font-size:16px;cursor:pointer;transition:0.2s}"
         ".btn:active{background:#874F41;transform:scale(0.98)}"
         ".btn:disabled{opacity:0.4;cursor:not-allowed}"
-        ".row{display:flex;gap:10px;margin-top:15px;}"
-        ".mode{font-size:12px;color:#90AEAD;margin-bottom:10px}"
+        ".row{display:flex;gap:10px;margin-top:8px}"
+        ".mbtn{display:inline-block;padding:8px 12px;border-radius:6px;font-size:13px;font-weight:bold;text-decoration:none;margin:0 3px}"
+        ".sel-row{margin:10px 0}"
+        ".pm{display:inline-block;padding:10px 18px;border-radius:8px;font-size:20px;font-weight:bold;text-decoration:none;background:#E64833;color:#FBE9D0}"
+        ".pm.off{opacity:0.4;pointer-events:none}"
+        ".status{font-size:20px;color:#FBE9D0;margin-top:15px;font-weight:bold}"
         "</style></head>"
         "<body><div class='container'>"
             "<div class='card'>"
-                "<h1>BeatMesh</h1>"
-                "<div class='mode'>Clock: %s</div>"
+                "<h1 style='font-size:40px;font-weight:900;letter-spacing:-2px;-webkit-text-stroke:1px #6D9773'>\xF0\x9D\x99\xB1\xF0\x9D\x9A\x8E\xF0\x9D\x9A\x8A\xF0\x9D\x9A\x9D\xF0\x9D\x99\xBC\xF0\x9D\x9A\x8E\xF0\x9D\x9A\x9C\xF0\x9D\x9A\x91</h1>"
+                "<div class='status'>PEERS: %zu &bull; %s</div>"
+                "<hr style='border:0;border-top:1px solid #874F41;margin:12px 0'>"
+                "<div class='sel-row'>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>PPQN: </span>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>METRONOME: </span>%s</div>"
                 "%s"
                 "<form action='/set_bpm' method='get'>"
-                    "<h2>TEMPO: %.1f BPM</h2>"
-                    "<input type='number' name='bpm' value='%.1f' step='0.1' inputmode='decimal'%s>"
+                    "<div style='display:flex;gap:8px;align-items:center;margin:10px 0'>"
+                        "<a href='/set_bpm?bpm=%.0f' class='pm%s'>-</a>"
+                        "<input type='number' name='bpm' value='%.0f' step='1' inputmode='numeric' style='flex:1;margin:0;font-size:32px;font-weight:bold'%s>"
+                        "<a href='/set_bpm?bpm=%.0f' class='pm%s'>+</a>"
+                    "</div>"
                     "<input type='submit' class='btn' value='UPDATE BPM'%s>"
                 "</form>"
                 "<form action='/transport' method='get' class='row'>"
@@ -488,8 +836,11 @@ static esp_err_t get_handler(httpd_req_t *req) {
                 "</form>"
             "</div>"
         "</div></body></html>",
-        mode_label, midi_banner,
-        current_bpm, current_bpm, disabled, disabled,
+        peers, conn_str,
+        mode_btns, ppqn_btns, metro_btn,
+        midi_banner,
+        bpm_minus, midi_is_master ? " off" : "", current_bpm, disabled, bpm_plus, midi_is_master ? " off" : "",
+        disabled,
         play_style, disabled, stop_style, disabled
     );
 
@@ -531,6 +882,7 @@ void start_setup_portal() {
         httpd_uri_t save = { .uri = "/save", .method = HTTP_GET, .handler = save_handler };
         httpd_uri_t set_bpm = { .uri = "/set_bpm", .method = HTTP_GET, .handler = set_bpm_handler };
         httpd_uri_t transport = { .uri = "/transport", .method = HTTP_GET, .handler = set_transport_handler };
+        httpd_uri_t set_mode = { .uri = "/set_mode", .method = HTTP_GET, .handler = set_mode_handler };
         httpd_uri_t connecttest = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = aggressive_close_handler };
         httpd_uri_t redirect = { .uri = "/redirect", .method = HTTP_GET, .handler = captive_portal_redirect };
         httpd_uri_t hotspot = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_portal_redirect };
@@ -541,6 +893,7 @@ void start_setup_portal() {
         httpd_register_uri_handler(server, &save);
         httpd_register_uri_handler(server, &set_bpm);
         httpd_register_uri_handler(server, &transport);
+        httpd_register_uri_handler(server, &set_mode);
         httpd_register_uri_handler(server, &connecttest);
         httpd_register_uri_handler(server, &redirect);
         httpd_register_uri_handler(server, &hotspot);
@@ -568,6 +921,9 @@ static void visual_task(void *param) {
     int last_btn_state = 1;
     uint32_t last_btn_time = 0;
     int last_midi_mode = MODE_LINK;
+    int last_cv_ppqn = 0;
+    uint32_t metro_off_time = 0;
+    bool last_metro_enabled = true; // force initial draw (metronome starts disabled)
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -591,13 +947,17 @@ static void visual_task(void *param) {
     tft->fillRoundRect(245, 10, 65, 50, 5, C_VINTAGE_AMBER);
     tft->drawString("+", 277, 35);
 
-    // Mode toggle button
-    tft->fillRoundRect(10, 100, 300, 40, 5, C_VINTAGE_FERN);
-    tft->setTextColor(C_VINTAGE_CREAM);
-    tft->drawString("Clock: LINK", 160, 120);
+    // Mode + PPQN selector buttons (initial draw triggers via last_midi_mode/last_cv_ppqn mismatch)
     tft->setTextDatum(top_left);
 
     while (true) {
+        // Metronome silence check
+        if (metro_off_time && esp_log_timestamp() >= metro_off_time) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            metro_off_time = 0;
+        }
+
         int btn_state = gpio_get_level(BTN_BOOT);
         if (btn_state == 0 && last_btn_state == 1 && (esp_log_timestamp() - last_btn_time > 300)) {
             abl_link_capture_app_session_state(s->link, s->session_state);
@@ -615,9 +975,35 @@ static void visual_task(void *param) {
                 abl_link_capture_app_session_state(s->link, s->session_state);
                 uint64_t now = abl_link_clock_micros(s->link);
 
-                if (ty >= 100 && ty < 140) {
-                    // Mode cycle: LINK → MIDI CLK → MIDI THRU → LINK
-                    midi_mode = (midi_mode + 1) % 3;
+                if (ty >= 100 && ty < 135) {
+                    // Mode buttons (row 1)
+                    for (int i = 0; i < 4; i++) {
+                        if (tx >= mode_btn_x[i] && tx < mode_btn_x[i] + mode_btn_w[i]) {
+                            midi_mode = i;
+                            break;
+                        }
+                    }
+                    last_touch = esp_log_timestamp();
+                }
+                else if (ty >= 150 && ty < 178) {
+                    if (tx >= 84 && tx < 166) {
+                        // MET toggle button
+                        metronome_enabled = !metronome_enabled;
+                        if (!metronome_enabled) {
+                            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                            metro_off_time = 0;
+                        }
+                    } else {
+                        // PPQN buttons (row 2)
+                        for (int i = 0; i < 3; i++) {
+                            if (tx >= ppqn_btn_x[i] && tx < ppqn_btn_x[i] + ppqn_btn_w[i]) {
+                                cv_ppqn_idx = i;
+                                cv_ppqn = cv_ppqn_options[i];
+                                break;
+                            }
+                        }
+                    }
                     last_touch = esp_log_timestamp();
                 }
                 else if (ty < 70) {
@@ -668,46 +1054,88 @@ static void visual_task(void *param) {
                     tft->fillRoundRect(rect_x[i], 70, rect_w[i], 12, 3, color);
                 }
                 gpio_set_level(LED_RED, (cur_beat == 0) ? LED_ON : LED_OFF);
+                // Metronome click: bip (1200Hz) on beat 1, bop (800Hz) on 2-4
+                if (metronome_enabled) {
+                    uint32_t freq = (cur_beat == 0) ? 1200 : 800;
+                    uint32_t dur = (cur_beat == 0) ? 40 : 30;
+                    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, freq);
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 512);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                    metro_off_time = esp_log_timestamp() + dur;
+                }
                 last_beat = cur_beat;
             }
         } else {
             if (last_beat != -2) {
                  for (int i=0; i<4; i++) tft->fillRoundRect(rect_x[i], 70, rect_w[i], 12, 3, C_VINTAGE_CREAM_DIM);
                  gpio_set_level(LED_RED, LED_OFF);
-                 last_beat = -2; 
+                 // Silence metronome on stop
+                 ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                 ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                 metro_off_time = 0;
+                 last_beat = -2;
             }
         }
 
         if (fabs(cur_bpm - last_bpm) > 0.1) {
-            tft->fillRect(10, 160, 160, 50, C_VINTAGE_BG); 
+            tft->fillRect(10, 176, 160, 35, C_VINTAGE_BG);
             tft->setTextColor(C_VINTAGE_CREAM); tft->setTextSize(4);
-            
-            // --- FIX: NO DECIMAL ---
             char bstr[16]; sprintf(bstr, "%.0f", cur_bpm);
-            tft->drawString(bstr, 10, 172); 
-            tft->setTextSize(2); 
-            tft->drawString("BPM", 92, 185); 
+            tft->drawString(bstr, 10, 181);
+            tft->setTextSize(2);
+            tft->drawString("BPM", 92, 195);
             last_bpm = cur_bpm;
         }
 
         if (peers != last_peers || last_peers == 999) {
-            tft->fillRect(180, 180, 140, 30, C_VINTAGE_BG);
+            tft->fillRect(180, 192, 140, 22, C_VINTAGE_BG);
             tft->setTextColor(C_VINTAGE_SAGE); tft->setTextSize(2);
             char pstr[20]; sprintf(pstr, "PEERS: %zu", peers);
-            tft->drawRightString(pstr, 310, 185);
+            tft->drawRightString(pstr, 310, 195);
             last_peers = peers;
         }
 
-        // Mode toggle button redraw
-        if (midi_mode != last_midi_mode) {
-            static const uint16_t mode_colors[] = { C_VINTAGE_FERN, C_VINTAGE_AMBER, C_VINTAGE_RUST };
-            static const char *mode_labels[] = { "Clock: LINK", "Clock: MIDI", "Clock: THRU" };
-            tft->fillRoundRect(10, 100, 300, 40, 5, mode_colors[midi_mode]);
-            tft->setTextColor(C_VINTAGE_CREAM); tft->setTextSize(2);
+        // Mode + PPQN button redraw
+        if (midi_mode != last_midi_mode || last_cv_ppqn != cv_ppqn) {
+            static const uint16_t mode_colors[] = { C_VINTAGE_FERN, C_VINTAGE_AMBER, C_VINTAGE_RUST, C_VINTAGE_SAGE };
+            // Row 1: Mode buttons (y=100, h=35)
+            tft->setTextSize(2);
             tft->setTextDatum(middle_center);
-            tft->drawString(mode_labels[midi_mode], 160, 120);
+            for (int i = 0; i < 4; i++) {
+                uint16_t bg = (i == midi_mode) ? mode_colors[i] : C_VINTAGE_BG_LT;
+                uint16_t fg = (i == midi_mode) ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
+                tft->fillRoundRect(mode_btn_x[i], 100, mode_btn_w[i], 35, 5, bg);
+                tft->setTextColor(fg);
+                tft->drawString(mode_labels[i], mode_btn_x[i] + mode_btn_w[i] / 2, 117);
+            }
+            // Row 2: PPQN label + buttons (y=150, h=28), right-aligned
+            tft->setTextSize(1);
+            tft->setTextColor(C_VINTAGE_CREAM_DIM);
+            tft->drawString("PPQN", 186, 164);
+            tft->setTextSize(2);
+            for (int i = 0; i < 3; i++) {
+                uint16_t bg = (i == cv_ppqn_idx) ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT;
+                uint16_t fg = (i == cv_ppqn_idx) ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
+                tft->fillRoundRect(ppqn_btn_x[i], 150, ppqn_btn_w[i], 28, 4, bg);
+                tft->setTextColor(fg);
+                tft->drawString(ppqn_labels[i], ppqn_btn_x[i] + ppqn_btn_w[i] / 2, 164);
+            }
             tft->setTextDatum(top_left);
             last_midi_mode = midi_mode;
+            last_cv_ppqn = cv_ppqn;
+        }
+
+        // METRONOME button redraw (left side of row 2)
+        if (metronome_enabled != last_metro_enabled) {
+            uint16_t bg = metronome_enabled ? C_VINTAGE_FERN : C_VINTAGE_BG_LT;
+            uint16_t fg = metronome_enabled ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
+            tft->fillRoundRect(84, 150, 80, 28, 4, bg);
+            tft->setTextSize(1);
+            tft->setTextColor(fg);
+            tft->setTextDatum(middle_center);
+            tft->drawString("METRONOME", 124, 164);
+            tft->setTextDatum(top_left);
+            last_metro_enabled = metronome_enabled;
         }
 
         // Status bar: alternate with router warning when peers > 2 in AP mode
@@ -808,6 +1236,9 @@ extern "C" void app_main(void) {
 
     // MIDI tasks: Core 1 (alongside Link), high priority for timing precision
     midi_init();
+    cv_clock_init();
+    cv_out_init();
+    metronome_init();
     xTaskCreatePinnedToCore(midi_clock_task, "midi_out", 4096, &g_link_state, 10, NULL, 1);
     xTaskCreatePinnedToCore(midi_in_task, "midi_in", 4096, &g_link_state, 10, NULL, 1);
 
