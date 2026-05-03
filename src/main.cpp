@@ -119,6 +119,18 @@ static volatile int cv_ppqn_idx = 1; // index into cv_ppqn_options (default: 4 P
 static volatile bool metronome_enabled = false;
 #define METRO_PIN GPIO_NUM_26
 
+// --- MIDI Monitor (small UI box, left of metronome button) ---
+static portMUX_TYPE g_mon_mux = portMUX_INITIALIZER_UNLOCKED;
+static char g_midi_mon_l1[10] = "";
+static char g_midi_mon_l2[12] = "";
+static volatile uint32_t g_midi_mon_seq = 0;
+static volatile int64_t g_midi_mon_last_us = 0;
+// Parser running-status state (only touched by midi_in_task)
+static uint8_t g_mon_status = 0;
+static uint8_t g_mon_data[2];
+static uint8_t g_mon_data_idx = 0;
+static uint8_t g_mon_data_needed = 0;
+
 // --- MIDI Clock (UART2 on CYD CN1 connector) ---
 #define MIDI_UART       UART_NUM_2
 #define MIDI_TX_PIN     27
@@ -236,6 +248,105 @@ static void midi_send_stop(void) {
 static void midi_send_continue(void) {
     const uint8_t b = 0xFB;
     uart_write_bytes(MIDI_UART, (const char *)&b, 1);
+}
+
+static void midi_mon_publish(const char *l1, const char *l2) {
+    portENTER_CRITICAL(&g_mon_mux);
+    strncpy(g_midi_mon_l1, l1, sizeof(g_midi_mon_l1));
+    g_midi_mon_l1[sizeof(g_midi_mon_l1) - 1] = 0;
+    strncpy(g_midi_mon_l2, l2, sizeof(g_midi_mon_l2));
+    g_midi_mon_l2[sizeof(g_midi_mon_l2) - 1] = 0;
+    g_midi_mon_last_us = esp_timer_get_time();
+    g_midi_mon_seq++;
+    portEXIT_CRITICAL(&g_mon_mux);
+}
+
+static void midi_mon_byte(uint8_t b) {
+    // System realtime: single-byte, doesn't disturb running status
+    if (b >= 0xF8) {
+        const char *name = NULL;
+        switch (b) {
+            case 0xF8: name = "CLK";   break;
+            case 0xFA: name = "START"; break;
+            case 0xFB: name = "CONT";  break;
+            case 0xFC: name = "STOP";  break;
+            case 0xFE: name = "ASEN";  break;
+            case 0xFF: name = "RSET";  break;
+        }
+        if (name) midi_mon_publish(name, "");
+        return;
+    }
+    // Status byte
+    if (b >= 0x80) {
+        if (b == 0xF6) { midi_mon_publish("TUNE", ""); g_mon_status = 0; return; }
+        g_mon_status = b;
+        g_mon_data_idx = 0;
+        switch (b & 0xF0) {
+            case 0x80: case 0x90: case 0xA0: case 0xB0: case 0xE0: g_mon_data_needed = 2; break;
+            case 0xC0: case 0xD0: g_mon_data_needed = 1; break;
+            case 0xF0:
+                if (b == 0xF1 || b == 0xF3)      g_mon_data_needed = 1;
+                else if (b == 0xF2)              g_mon_data_needed = 2;
+                else                             g_mon_data_needed = 0;
+                break;
+            default: g_mon_data_needed = 0; break;
+        }
+        return;
+    }
+    // Data byte
+    if (g_mon_status == 0 || g_mon_data_needed == 0) return;
+    g_mon_data[g_mon_data_idx++] = b;
+    if (g_mon_data_idx < g_mon_data_needed) return;
+    g_mon_data_idx = 0;
+
+    char l1[10], l2[12];
+    if (g_mon_status >= 0xF0) {
+        switch (g_mon_status) {
+            case 0xF1: snprintf(l1, sizeof(l1), "MTC");  snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
+            case 0xF2: { int p = (g_mon_data[1] << 7) | g_mon_data[0];
+                         snprintf(l1, sizeof(l1), "SPP");  snprintf(l2, sizeof(l2), "%d", p); break; }
+            case 0xF3: snprintf(l1, sizeof(l1), "SONG"); snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
+            default: g_mon_status = 0; return;
+        }
+        g_mon_status = 0;
+    } else {
+        uint8_t st = g_mon_status & 0xF0;
+        uint8_t ch = (g_mon_status & 0x0F) + 1;
+        switch (st) {
+            case 0x80:
+                snprintf(l1, sizeof(l1), "OFF c%d", ch);
+                snprintf(l2, sizeof(l2), "%d v%d", g_mon_data[0], g_mon_data[1]);
+                break;
+            case 0x90:
+                snprintf(l1, sizeof(l1), g_mon_data[1] ? "NOTE c%d" : "OFF c%d", ch);
+                snprintf(l2, sizeof(l2), "%d v%d", g_mon_data[0], g_mon_data[1]);
+                break;
+            case 0xA0:
+                snprintf(l1, sizeof(l1), "AT c%d", ch);
+                snprintf(l2, sizeof(l2), "%d:%d", g_mon_data[0], g_mon_data[1]);
+                break;
+            case 0xB0:
+                snprintf(l1, sizeof(l1), "CC c%d", ch);
+                snprintf(l2, sizeof(l2), "%d:%d", g_mon_data[0], g_mon_data[1]);
+                break;
+            case 0xC0:
+                snprintf(l1, sizeof(l1), "PRG c%d", ch);
+                snprintf(l2, sizeof(l2), "%d", g_mon_data[0]);
+                break;
+            case 0xD0:
+                snprintf(l1, sizeof(l1), "CHP c%d", ch);
+                snprintf(l2, sizeof(l2), "%d", g_mon_data[0]);
+                break;
+            case 0xE0: {
+                int pb = ((g_mon_data[1] << 7) | g_mon_data[0]) - 8192;
+                snprintf(l1, sizeof(l1), "PB c%d", ch);
+                snprintf(l2, sizeof(l2), "%d", pb);
+                break;
+            }
+            default: return;
+        }
+    }
+    midi_mon_publish(l1, l2);
 }
 
 // Timer ISR: notify MIDI task every 100us
@@ -388,10 +499,14 @@ static void midi_in_task(void *param) {
     // CV clock state
     cv_task_handle = xTaskGetCurrentTaskHandle();
     bool cv_playing = false;
+    int64_t cv_last_pulse_us = 0;
 
     while (true) {
         if (midi_mode == MODE_LINK) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            // Passive MIDI sniff for monitor display: blocks in the UART driver
+            // until bytes arrive (ISR-driven, ~zero idle CPU) or 100ms passes.
+            int len = uart_read_bytes(MIDI_UART, buf, sizeof(buf), pdMS_TO_TICKS(100));
+            for (int i = 0; i < len; i++) midi_mon_byte(buf[i]);
             tick_count = 0;
             cv_playing = false;
             continue;
@@ -401,13 +516,23 @@ static void midi_in_task(void *param) {
         if (midi_mode == MODE_CV) {
             int ppqn = cv_ppqn;
 
-            // Dynamic timeout: 2x last interval, or 2s if unknown
-            TickType_t timeout = (cv_interval_us > 0)
-                ? pdMS_TO_TICKS(cv_interval_us / 500 + 1)  // 2x interval in ms
-                : pdMS_TO_TICKS(2000);
+            // Real timeout for clock-stopped detection (independent of poll rate)
+            int64_t cv_timeout_us = (cv_interval_us > 0)
+                ? ((int64_t)cv_interval_us * 2)
+                : 2000000LL;
 
-            if (ulTaskNotifyTake(pdTRUE, timeout)) {
-                // Pulse received - calculate BPM
+            // Cap notify wait at 100ms so we periodically peek the UART for the
+            // monitor. ulTaskNotifyTake sleeps; ~10 wakes/sec when idle is negligible.
+            bool got = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            int64_t now = esp_timer_get_time();
+
+            // Non-blocking peek (timeout=0): consumes any queued bytes if present,
+            // returns immediately when empty. Cost when idle ≈ 0.
+            int len = uart_read_bytes(MIDI_UART, buf, sizeof(buf), 0);
+            for (int i = 0; i < len; i++) midi_mon_byte(buf[i]);
+
+            if (got) {
+                cv_last_pulse_us = now;
                 int64_t interval = cv_interval_us;
                 if (interval > 0) {
                     double bpm = 60000000.0 / ((double)interval * ppqn);
@@ -421,14 +546,13 @@ static void midi_in_task(void *param) {
                         abl_link_commit_app_session_state(s->link, midi_in_ss);
                     }
                 }
-            } else {
-                // Timeout - clock stopped
-                if (cv_playing) {
-                    abl_link_capture_app_session_state(s->link, midi_in_ss);
-                    abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
-                    abl_link_commit_app_session_state(s->link, midi_in_ss);
-                    cv_playing = false;
-                }
+            } else if (cv_playing && cv_last_pulse_us > 0 &&
+                       (now - cv_last_pulse_us) > cv_timeout_us) {
+                // Clock stopped
+                abl_link_capture_app_session_state(s->link, midi_in_ss);
+                abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
+                abl_link_commit_app_session_state(s->link, midi_in_ss);
+                cv_playing = false;
             }
             continue;
         }
@@ -446,6 +570,7 @@ static void midi_in_task(void *param) {
 
             // Scan forwarded data for transport messages to keep Link in sync
             for (int i = 0; i < len; i++) {
+                midi_mon_byte(buf[i]);
                 switch (buf[i]) {
                 case 0xF8:
                     tick_count++;
@@ -492,6 +617,8 @@ static void midi_in_task(void *param) {
         uint8_t byte;
         int len = uart_read_bytes(MIDI_UART, &byte, 1, pdMS_TO_TICKS(20));
         if (len <= 0) continue;
+
+        midi_mon_byte(byte);
 
         switch (byte) {
         case 0xF8: // Clock tick
@@ -542,13 +669,15 @@ static void midi_in_task(void *param) {
             uint8_t spp[3] = { byte, 0, 0 };
             int r1 = uart_read_bytes(MIDI_UART, &spp[1], 1, pdMS_TO_TICKS(20));
             int r2 = uart_read_bytes(MIDI_UART, &spp[2], 1, pdMS_TO_TICKS(20));
+            if (r1 > 0) midi_mon_byte(spp[1]);
+            if (r2 > 0) midi_mon_byte(spp[2]);
             if (r1 > 0 && r2 > 0) {
                 uart_write_bytes(MIDI_UART, (const char *)spp, 3);
             }
             break;
         }
 
-        default: // MIDI CLK: drop non-transport bytes
+        default: // MIDI CLK: drop non-transport bytes (monitor still sees them via the call above)
             break;
         }
     }
@@ -1136,6 +1265,41 @@ static void visual_task(void *param) {
             tft->drawString("METRONOME", 124, 164);
             tft->setTextDatum(top_left);
             last_metro_enabled = metronome_enabled;
+        }
+
+        // MIDI monitor (left of metronome): activity LED + last message
+        {
+            static uint32_t last_mon_seq = 0xFFFFFFFFu; // force first draw
+            static bool last_mon_led = false;
+            char l1[10], l2[12];
+            uint32_t cur_seq;
+            int64_t last_us;
+            portENTER_CRITICAL(&g_mon_mux);
+            cur_seq = g_midi_mon_seq;
+            last_us = g_midi_mon_last_us;
+            strncpy(l1, g_midi_mon_l1, sizeof(l1));
+            strncpy(l2, g_midi_mon_l2, sizeof(l2));
+            portEXIT_CRITICAL(&g_mon_mux);
+            l1[sizeof(l1) - 1] = 0;
+            l2[sizeof(l2) - 1] = 0;
+
+            bool led_on = (last_us != 0) && ((esp_timer_get_time() - last_us) < 80000);
+
+            if (cur_seq != last_mon_seq) {
+                tft->fillRect(10, 146, 70, 28, C_VINTAGE_BG);
+                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+                tft->setTextSize(1);
+                tft->setTextDatum(top_left);
+                tft->setTextColor(C_VINTAGE_CREAM);
+                tft->drawString(l1, 22, 148);
+                tft->setTextColor(C_VINTAGE_CREAM_DIM);
+                tft->drawString(l2, 22, 162);
+                last_mon_seq = cur_seq;
+                last_mon_led = led_on;
+            } else if (led_on != last_mon_led) {
+                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+                last_mon_led = led_on;
+            }
         }
 
         // Status bar: alternate with router warning when peers > 2 in AP mode
