@@ -1287,7 +1287,7 @@ static void visual_task(void *param) {
 
             if (cur_seq != last_mon_seq) {
                 tft->fillRect(10, 146, 70, 28, C_VINTAGE_BG);
-                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
                 tft->setTextSize(1);
                 tft->setTextDatum(top_left);
                 tft->setTextColor(C_VINTAGE_CREAM);
@@ -1297,7 +1297,7 @@ static void visual_task(void *param) {
                 last_mon_seq = cur_seq;
                 last_mon_led = led_on;
             } else if (led_on != last_mon_led) {
-                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
                 last_mon_led = led_on;
             }
         }

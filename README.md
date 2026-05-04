@@ -11,6 +11,14 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 - **CV Integration:** CV clock, reset, and play-stop outputs.
 - **Ableton Link:** Synchronize seamlessly over WiFi.
 
+[![Schematic](board/schematic.png)](board/schematic.pdf)
+
+![Board](board/board.png)
+
+![UI](UI.jpg)
+
+![Web UI](UI_web.png)
+
 ---
 
 ## 🎛️ Custom PCB (KiCad)
