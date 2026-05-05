@@ -50,17 +50,17 @@ External components live under `components/` as git submodules pinned to the ver
 
 ### Cloning
 
-> **Important:** copy the **entire** command below. The `-c url.…insteadOf=…` flag rewrites SSH GitHub URLs to HTTPS for the duration of the command. It is required because the nested `vendor/ableton-link` submodule (inside `esp_abl_link`) is pinned to `git@github.com:Ableton/link.git` upstream — without the flag, the recursive clone fails with `Permission denied (publickey)` for anyone without GitHub SSH keys. Harmless if you do have SSH keys set up.
-
 ```bash
-git clone --recurse-submodules -c url."https://github.com/".insteadOf=git@github.com: https://github.com/patricksebastien/BeatMesh.git
+git clone --recurse-submodules https://github.com/patricksebastien/BeatMesh.git
 ```
 
 If you already cloned without `--recurse-submodules`:
 
 ```bash
-git -c url."https://github.com/".insteadOf=git@github.com: submodule update --init --recursive
+git submodule update --init --recursive
 ```
+
+> Use `git config --global url."https://github.com/".insteadOf git@github.com:` if you don't have ssh key configured.
 
 ### ASIO Patch (Required)
 To prevent the ESP32 from rebooting during transient network errors (e.g., `send_to ENOMEM`), ASIO needs a small patch. Link recovers from packet loss gracefully, so we do not want `std::terminate` to abort the program.
