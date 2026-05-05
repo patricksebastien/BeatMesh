@@ -1,0 +1,9 @@
+[submodule "components/asio/asio"]
+	path = components/asio/asio
+	url = https://github.com/chriskohlhoff/asio.git
+[submodule "components/esp_abl_link"]
+	path = components/esp_abl_link
+	url = https://github.com/docwilco/esp_abl_link.git
+[submodule "components/LovyanGFX"]
+	path = components/LovyanGFX
+	url = https://github.com/lovyan03/LovyanGFX.git

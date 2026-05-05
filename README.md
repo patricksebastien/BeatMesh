@@ -37,31 +37,36 @@ The repository includes a production-ready printed circuit board designed in **K
 
 ## 💻 Installation & Dependencies
 
-This project relies on several external components. Clone them into a `components` directory at the root of your project:
+> Built with ESP-IDF v5.5.0
+
+External components live under `components/` as git submodules pinned to the versions used in this project:
+
+| Submodule | Upstream | Pinned at |
+|---|---|---|
+| `components/asio/asio` | [chriskohlhoff/asio](https://github.com/chriskohlhoff/asio) | `asio-1-32-0` |
+| `components/esp_abl_link` | [docwilco/esp_abl_link](https://github.com/docwilco/esp_abl_link) | `v3.1.5-1` |
+| `components/esp_abl_link/vendor/ableton-link` | [Ableton/link](https://github.com/Ableton/link) | `Link-3.1.5` |
+| `components/LovyanGFX` | [lovyan03/LovyanGFX](https://github.com/lovyan03/LovyanGFX) | `1.2.19` |
+
+### Cloning
 
 ```bash
-mkdir components
-cd components
-git clone [https://github.com/chriskohlhoff/asio.git](https://github.com/chriskohlhoff/asio.git)
-git clone [https://github.com/Ableton/link.git](https://github.com/Ableton/link.git)
-git clone [https://github.com/lovyan03/LovyanGFX.git](https://github.com/lovyan03/LovyanGFX.git)
+git clone --recurse-submodules https://github.com/patricksebastien/BeatMesh.git
+```
+
+If you already cloned without `--recurse-submodules`:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ### ASIO Patch (Required)
-To prevent the ESP32 from rebooting during transient network errors (e.g., `send_to ENOMEM`), you must modify the ASIO library. Link recovers from packet loss gracefully, so we do not want `std::terminate` to abort the program.
+To prevent the ESP32 from rebooting during transient network errors (e.g., `send_to ENOMEM`), ASIO needs a small patch. Link recovers from packet loss gracefully, so we do not want `std::terminate` to abort the program.
 
-Find the exception handling block in ASIO and modify it to set the pointer to `nullptr`:
+Apply the patch shipped in this repo:
 
-```cpp
-#if !defined(ASIO_NO_EXCEPTIONS)
-    if (has_pending_exception_ > 0)
-    {
-      // ESP32 FIX: Don't rethrow - transient network errors 
-      // would call std::terminate -> abort -> reboot. Link recovers from packet loss.
-      has_pending_exception_ = 0;
-      pending_exception_ = nullptr;
-    }
-#endif // !defined(ASIO_NO_EXCEPTIONS)
+```bash
+git -C components/asio/asio apply ../../../patches/asio-esp32-rethrow-fix.patch
 ```
 
 ---

@@ -1,0 +1,19 @@
+diff --git a/asio/include/asio/detail/thread_info_base.hpp b/asio/include/asio/detail/thread_info_base.hpp
+index 66cb1af..7075845 100644
+--- a/asio/include/asio/detail/thread_info_base.hpp
++++ b/asio/include/asio/detail/thread_info_base.hpp
+@@ -229,11 +229,10 @@ public:
+ #if !defined(ASIO_NO_EXCEPTIONS)
+     if (has_pending_exception_ > 0)
+     {
++      // ESP32 FIX: Don't rethrow - transient network errors (e.g. send_to ENOMEM)
++      // would call std::terminate -> abort -> reboot. Link recovers from packet loss.
+       has_pending_exception_ = 0;
+-      std::exception_ptr ex(
+-          static_cast<std::exception_ptr&&>(
+-            pending_exception_));
+-      std::rethrow_exception(ex);
++      pending_exception_ = nullptr;
+     }
+ #endif // !defined(ASIO_NO_EXCEPTIONS)
+   }
