@@ -23,7 +23,7 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 
 ## 🎛️ Custom PCB (KiCad)
 
-The repository includes a production-ready printed circuit board designed in **KiCad 9**. You can find the source files (`.kicad_sch` and `.kicad_pcb`) in the `board/` directory.
+The repository includes a production-ready printed circuit board designed in **KiCad 10**. You can find the source files (`.kicad_sch` and `.kicad_pcb`) in the `board/` directory.
 
 > ⚠️ **V1 PCB Errata:** The 2-pin power connector near the USB-C port has its silkscreen polarity printed incorrectly. The actual pinout is **GND, VCC** (not VCC, GND as silkscreened). Wire accordingly to avoid damage.
 
