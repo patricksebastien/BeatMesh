@@ -25,6 +25,8 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 
 The repository includes a production-ready printed circuit board designed in **KiCad 9**. You can find the source files (`.kicad_sch` and `.kicad_pcb`) in the `board/` directory.
 
+> ⚠️ **V1 PCB Errata:** The 2-pin power connector near the USB-C port has its silkscreen polarity printed incorrectly. The actual pinout is **GND, VCC** (not VCC, GND as silkscreened). Wire accordingly to avoid damage.
+
 ### Hardware Design Highlights:
 - **Form Factor:** 100mm x 100mm, 2-layer board (optimized for low-cost fabrication).
 - **MIDI Input:** Fully opto-isolated using a **6N138** optocoupler. The circuit is properly level-shifted to send safe 3.3V logic to the ESP32, while powering the optocoupler with 5V for fast, reliable data transmission.
