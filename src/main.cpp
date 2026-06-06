@@ -96,10 +96,10 @@ static char s_ssid_name[33] = {0};
 // --- Mode/PPQN button layout (y=100, h=40) ---
 static const int mode_btn_x[] = { 10, 86, 162, 238 };
 static const int mode_btn_w[] = { 71, 71, 71, 72 };
-static const int ppqn_btn_x[] = { 206, 242, 278 };
-static const int ppqn_btn_w[] = { 32, 32, 32 };
+static const int ppqn_btn_x = 246;   // single cycling button (tap to advance)
+static const int ppqn_btn_w = 62;
 static const char *mode_labels[] = { "LINK", "MIDI", "THR", "CV" };
-static const char *ppqn_labels[] = { "1", "4", "24" };
+static const char *ppqn_labels[] = { "1", "2", "4", "8", "24", "48" };
 
 typedef struct { 
     abl_link link; 
@@ -110,10 +110,11 @@ static link_state_t g_link_state;
 enum midi_mode_t { MODE_LINK = 0, MODE_MIDI_CLK = 1, MODE_MIDI_THRU = 2, MODE_CV = 3, MODE_COUNT = 4 };
 static volatile int midi_mode = MODE_LINK;
 
-// Shared PPQN setting for CV in/out (1, 4, or 24)
+// Shared PPQN setting for CV in/out — single button cycles through these
 static volatile int cv_ppqn = 4;
-static const int cv_ppqn_options[] = { 1, 4, 24 };
-static volatile int cv_ppqn_idx = 1; // index into cv_ppqn_options (default: 4 PPQN)
+static const int cv_ppqn_options[] = { 1, 2, 4, 8, 24, 48 };
+static const int cv_ppqn_count = 6;
+static volatile int cv_ppqn_idx = 2; // index into cv_ppqn_options (default: 4 PPQN)
 
 // Metronome (LEDC PWM on GPIO 26 → onboard amp/speaker)
 static volatile bool metronome_enabled = false;
@@ -131,10 +132,15 @@ static uint8_t g_mon_data[2];
 static uint8_t g_mon_data_idx = 0;
 static uint8_t g_mon_data_needed = 0;
 
-// --- MIDI Clock (UART2 on CYD CN1 connector) ---
+// --- MIDI Clock (UART2 routed to CYD's UART0 header pins via GPIO matrix) ---
+// Board net ESP32_TX = GPIO 1 (U0TXD), ESP32_RX = GPIO 3 (U0RXD).
+// Using UART_NUM_2 on these pins avoids touching the boot-ROM UART0 driver,
+// but the GPIO mux will steal GPIO1/3 from UART0 — USB serial console stops
+// working once midi_init() runs. Disconnect/close the USB serial monitor when
+// feeding MIDI in, otherwise the host CDC chip will drive GPIO 3 against the opto.
 #define MIDI_UART       UART_NUM_2
-#define MIDI_TX_PIN     27
-#define MIDI_RX_PIN     22
+#define MIDI_TX_PIN     1
+#define MIDI_RX_PIN     3
 #define MIDI_BAUD       31250
 #define MIDI_TICK_PERIOD 100  // Timer period in microseconds (10kHz polling)
 
@@ -172,14 +178,14 @@ static void cv_clock_init(void) {
 
 // --- CV Clock output (Link → CV gates/triggers, always active) ---
 // Dedicated pins from SD card connector (no conflicts)
-#define CV_OUT_CLK_PIN      GPIO_NUM_19  // CV Clock (not a strapping pin)
-#define CV_OUT_RESET_PIN    GPIO_NUM_23  // SD_MOSI → CV Reset
-#define CV_OUT_RUN_PIN      GPIO_NUM_18  // SD_SCK  → CV Play/Stop
+#define CV_OUT_CLK_PIN      GPIO_NUM_22  // CV Clock (CYD IO22, not a strapping pin)
+#define CV_OUT_RESET_PIN    GPIO_NUM_27  // CYD IO27 (expansion header) → CV Reset
+// #define CV_OUT_RUN_PIN      GPIO_NUM_18  // SD_SCK → CV Play/Stop (disabled: modular gear uses Clock+Reset only)
 #define CV_PULSE_WIDTH_US   5000         // 5ms trigger pulse
 
 static void cv_out_init(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << CV_OUT_CLK_PIN) | (1ULL << CV_OUT_RESET_PIN) | (1ULL << CV_OUT_RUN_PIN),
+        .pin_bit_mask = (1ULL << CV_OUT_CLK_PIN) | (1ULL << CV_OUT_RESET_PIN), // | (1ULL << CV_OUT_RUN_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -188,7 +194,7 @@ static void cv_out_init(void) {
     gpio_config(&io_conf);
     gpio_set_level(CV_OUT_CLK_PIN, 0);
     gpio_set_level(CV_OUT_RESET_PIN, 0);
-    gpio_set_level(CV_OUT_RUN_PIN, 0);
+    // gpio_set_level(CV_OUT_RUN_PIN, 0);
 }
 
 static void metronome_init(void) {
@@ -270,7 +276,6 @@ static void midi_mon_byte(uint8_t b) {
             case 0xFA: name = "START"; break;
             case 0xFB: name = "CONT";  break;
             case 0xFC: name = "STOP";  break;
-            case 0xFE: name = "ASEN";  break;
             case 0xFF: name = "RSET";  break;
         }
         if (name) midi_mon_publish(name, "");
@@ -278,7 +283,7 @@ static void midi_mon_byte(uint8_t b) {
     }
     // Status byte
     if (b >= 0x80) {
-        if (b == 0xF6) { midi_mon_publish("TUNE", ""); g_mon_status = 0; return; }
+        // if (b == 0xF6) { midi_mon_publish("TUNE", ""); g_mon_status = 0; return; }
         g_mon_status = b;
         g_mon_data_idx = 0;
         switch (b & 0xF0) {
@@ -302,10 +307,10 @@ static void midi_mon_byte(uint8_t b) {
     char l1[10], l2[12];
     if (g_mon_status >= 0xF0) {
         switch (g_mon_status) {
-            case 0xF1: snprintf(l1, sizeof(l1), "MTC");  snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
-            case 0xF2: { int p = (g_mon_data[1] << 7) | g_mon_data[0];
-                         snprintf(l1, sizeof(l1), "SPP");  snprintf(l2, sizeof(l2), "%d", p); break; }
-            case 0xF3: snprintf(l1, sizeof(l1), "SONG"); snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
+            // case 0xF1: snprintf(l1, sizeof(l1), "MTC");  snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
+            // case 0xF2: { int p = (g_mon_data[1] << 7) | g_mon_data[0];
+            //              snprintf(l1, sizeof(l1), "SPP");  snprintf(l2, sizeof(l2), "%d", p); break; }
+            // case 0xF3: snprintf(l1, sizeof(l1), "SONG"); snprintf(l2, sizeof(l2), "%d", g_mon_data[0]); break;
             default: g_mon_status = 0; return;
         }
         g_mon_status = 0;
@@ -321,10 +326,10 @@ static void midi_mon_byte(uint8_t b) {
                 snprintf(l1, sizeof(l1), g_mon_data[1] ? "NOTE c%d" : "OFF c%d", ch);
                 snprintf(l2, sizeof(l2), "%d v%d", g_mon_data[0], g_mon_data[1]);
                 break;
-            case 0xA0:
-                snprintf(l1, sizeof(l1), "AT c%d", ch);
-                snprintf(l2, sizeof(l2), "%d:%d", g_mon_data[0], g_mon_data[1]);
-                break;
+            // case 0xA0:
+            //     snprintf(l1, sizeof(l1), "AT c%d", ch);
+            //     snprintf(l2, sizeof(l2), "%d:%d", g_mon_data[0], g_mon_data[1]);
+            //     break;
             case 0xB0:
                 snprintf(l1, sizeof(l1), "CC c%d", ch);
                 snprintf(l2, sizeof(l2), "%d:%d", g_mon_data[0], g_mon_data[1]);
@@ -333,16 +338,16 @@ static void midi_mon_byte(uint8_t b) {
                 snprintf(l1, sizeof(l1), "PRG c%d", ch);
                 snprintf(l2, sizeof(l2), "%d", g_mon_data[0]);
                 break;
-            case 0xD0:
-                snprintf(l1, sizeof(l1), "CHP c%d", ch);
-                snprintf(l2, sizeof(l2), "%d", g_mon_data[0]);
-                break;
-            case 0xE0: {
-                int pb = ((g_mon_data[1] << 7) | g_mon_data[0]) - 8192;
-                snprintf(l1, sizeof(l1), "PB c%d", ch);
-                snprintf(l2, sizeof(l2), "%d", pb);
-                break;
-            }
+            // case 0xD0:
+            //     snprintf(l1, sizeof(l1), "CHP c%d", ch);
+            //     snprintf(l2, sizeof(l2), "%d", g_mon_data[0]);
+            //     break;
+            // case 0xE0: {
+            //     int pb = ((g_mon_data[1] << 7) | g_mon_data[0]) - 8192;
+            //     snprintf(l1, sizeof(l1), "PB c%d", ch);
+            //     snprintf(l2, sizeof(l2), "%d", pb);
+            //     break;
+            // }
             default: return;
         }
     }
@@ -430,14 +435,14 @@ static void midi_clock_task(void *param) {
             cv_reset_pulse_end = 0;
         }
 
-        // Start/stop: run gate + reset trigger on start
+        // Start/stop: reset trigger on start (run gate disabled)
         if (playing && !cv_last_playing) {
-            gpio_set_level(CV_OUT_RUN_PIN, 1);
+            // gpio_set_level(CV_OUT_RUN_PIN, 1);
             gpio_set_level(CV_OUT_RESET_PIN, 1);
             cv_reset_pulse_end = now_us + CV_PULSE_WIDTH_US;
             last_cv_ticks = (int)floor(beat * (double)cur_ppqn);
         } else if (!playing && cv_last_playing) {
-            gpio_set_level(CV_OUT_RUN_PIN, 0);
+            // gpio_set_level(CV_OUT_RUN_PIN, 0);
             gpio_set_level(CV_OUT_CLK_PIN, 0);
             cv_clk_pulse_end = 0;
         }
@@ -487,6 +492,46 @@ static void midi_clock_task(void *param) {
     }
 }
 
+// Tempo update from a MIDI-clock-derived measurement. Three regimes:
+//   * First call after boot or post-silence (*first == true): snap. Avoids
+//     spending tens of seconds slewing from a stale Link tempo to whatever
+//     the source actually is.
+//   * |measured - smoothed| >= SNAP_THRESHOLD: snap. Anything that big after
+//     4-beat averaging is much more likely to be a real tempo change than
+//     measurement noise (residual σ is ~1 BPM, so ≥5 BPM is rare enough that
+//     treating it as intentional gives much better UX than slowly slewing).
+//   * Otherwise: EMA at ALPHA. The 1/ALPHA exponential time constant is what
+//     attenuates the residual jitter into a stable rounded display; with
+//     ALPHA=0.15 and a 2.4 s measurement window that's ~16 s to lock in on a
+//     small tempo nudge.
+//
+// *bpm_smoothed holds the high-precision running estimate. We round only when
+// writing into Link, so what gear/peers/UI all see is an integer BPM matching
+// what the source is set to. Smoothing itself runs in continuous space —
+// quantizing the state would create a systematic bias locking Link onto
+// whichever side of 0.5 the first snap landed on.
+#define MIDI_TEMPO_EMA_ALPHA       0.15
+#define MIDI_TEMPO_SNAP_THRESHOLD  5.0
+static void midi_apply_tempo_slewed(link_state_t *s, abl_link_session_state ss,
+                                    double measured_bpm, uint64_t now_us,
+                                    bool *first, double *bpm_smoothed) {
+    if (measured_bpm <= 20.0 || measured_bpm >= 999.0) return;
+    if (*first) {
+        *bpm_smoothed = measured_bpm;
+        *first = false;
+    } else {
+        double diff = measured_bpm - *bpm_smoothed;
+        if (fabs(diff) >= MIDI_TEMPO_SNAP_THRESHOLD) {
+            *bpm_smoothed = measured_bpm;
+        } else {
+            *bpm_smoothed += MIDI_TEMPO_EMA_ALPHA * diff;
+        }
+    }
+    abl_link_capture_app_session_state(s->link, ss);
+    abl_link_set_tempo(ss, round(*bpm_smoothed), now_us);
+    abl_link_commit_app_session_state(s->link, ss);
+}
+
 // --- MIDI IN: forward + drive Link (mode-dependent filtering) ---
 static void midi_in_task(void *param) {
     link_state_t *s = (link_state_t *)param;
@@ -495,6 +540,19 @@ static void midi_in_task(void *param) {
     uint8_t buf[128];
     int tick_count = 0;
     int64_t first_tick_us = 0;
+    // Time of the most recent 0xF8 byte. Used to detect a long silence in the
+    // clock stream (gear stopped, song change), at which point we discard the
+    // partial measurement window and snap the next BPM measurement instead of
+    // slewing — which would otherwise spend ~30s converging to the new tempo.
+    int64_t last_tick_us = 0;
+    // True until the first BPM measurement is made (boot or post-silence). Snap
+    // that one, then slew afterwards. Toggled by the silence-detection logic
+    // below and consumed by midi_apply_tempo_slewed().
+    bool first_tempo_measurement = true;
+    // High-precision smoothed BPM estimate. Lives in continuous space so the
+    // EMA can converge cleanly; midi_apply_tempo_slewed() rounds when writing
+    // into Link. Initialised on the first snap.
+    double bpm_smoothed = 0.0;
 
     // CV clock state
     cv_task_handle = xTaskGetCurrentTaskHandle();
@@ -572,31 +630,50 @@ static void midi_in_task(void *param) {
             for (int i = 0; i < len; i++) {
                 midi_mon_byte(buf[i]);
                 switch (buf[i]) {
-                case 0xF8:
+                case 0xF8: {
+                    int64_t now = (int64_t)abl_link_clock_micros(s->link);
+                    if (last_tick_us > 0 && (now - last_tick_us) > 5000000LL) {
+                        // >5s silence: assume a session boundary (transport
+                        // stopped, song changed). Discard the partial window
+                        // and snap the next measurement so we don't spend ~30s
+                        // slewing to a possibly very different new tempo.
+                        tick_count = 0;
+                        first_tempo_measurement = true;
+                    }
+                    last_tick_us = now;
                     tick_count++;
                     if (tick_count == 1) {
-                        first_tick_us = (int64_t)abl_link_clock_micros(s->link);
-                    } else if (tick_count >= 25) {
-                        int64_t now_us = (int64_t)abl_link_clock_micros(s->link);
-                        int64_t elapsed = now_us - first_tick_us;
+                        first_tick_us = now;
+                    } else if (tick_count >= 97) {
+                        // 96 intervals = 4 beats. Wider window dilutes per-byte
+                        // task-scheduling jitter that otherwise shows up as ±10% BPM noise.
+                        int64_t elapsed = now - first_tick_us;
                         if (elapsed > 0) {
-                            double bpm = 60000000.0 / (double)elapsed;
-                            if (bpm > 20.0 && bpm < 999.0) {
-                                abl_link_capture_app_session_state(s->link, midi_in_ss);
-                                abl_link_set_tempo(midi_in_ss, bpm, (uint64_t)now_us);
-                                abl_link_commit_app_session_state(s->link, midi_in_ss);
-                            }
+                            double bpm = 240000000.0 / (double)elapsed;
+                            midi_apply_tempo_slewed(s, midi_in_ss, bpm,
+                                                    (uint64_t)now,
+                                                    &first_tempo_measurement,
+                                                    &bpm_smoothed);
                         }
                         tick_count = 1;
-                        first_tick_us = now_us;
+                        first_tick_us = now;
                     }
                     break;
-                case 0xFA:
+                }
+                case 0xFA: {
+                    // START: align Link beat 0 to this instant. Use request
+                    // (not force) so that when other Link peers are present
+                    // they get a phase-aligned transition at the next beat
+                    // boundary instead of an instant yank. Solo session: this
+                    // behaves identically to an immediate force.
+                    uint64_t now = abl_link_clock_micros(s->link);
                     abl_link_capture_app_session_state(s->link, midi_in_ss);
-                    abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+                    abl_link_set_is_playing(midi_in_ss, true, now);
+                    abl_link_request_beat_at_time(midi_in_ss, 0.0, (int64_t)now, 1.0);
                     abl_link_commit_app_session_state(s->link, midi_in_ss);
                     tick_count = 0;
                     break;
+                }
                 case 0xFB:
                     abl_link_capture_app_session_state(s->link, midi_in_ss);
                     abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
@@ -621,34 +698,48 @@ static void midi_in_task(void *param) {
         midi_mon_byte(byte);
 
         switch (byte) {
-        case 0xF8: // Clock tick
+        case 0xF8: { // Clock tick
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
+            int64_t now = (int64_t)abl_link_clock_micros(s->link);
+            if (last_tick_us > 0 && (now - last_tick_us) > 5000000LL) {
+                // >5s silence: see MODE_MIDI_THRU note. Discard partial window,
+                // snap next measurement.
+                tick_count = 0;
+                first_tempo_measurement = true;
+            }
+            last_tick_us = now;
             tick_count++;
             if (tick_count == 1) {
-                first_tick_us = (int64_t)abl_link_clock_micros(s->link);
-            } else if (tick_count >= 25) {
-                int64_t now_us = (int64_t)abl_link_clock_micros(s->link);
-                int64_t elapsed = now_us - first_tick_us;
+                first_tick_us = now;
+            } else if (tick_count >= 97) {
+                // 96 intervals = 4 beats; see MODE_MIDI_THRU note above.
+                int64_t elapsed = now - first_tick_us;
                 if (elapsed > 0) {
-                    double bpm = 60000000.0 / (double)elapsed;
-                    if (bpm > 20.0 && bpm < 999.0) {
-                        abl_link_capture_app_session_state(s->link, midi_in_ss);
-                        abl_link_set_tempo(midi_in_ss, bpm, (uint64_t)now_us);
-                        abl_link_commit_app_session_state(s->link, midi_in_ss);
-                    }
+                    double bpm = 240000000.0 / (double)elapsed;
+                    midi_apply_tempo_slewed(s, midi_in_ss, bpm,
+                                            (uint64_t)now,
+                                            &first_tempo_measurement,
+                                            &bpm_smoothed);
                 }
                 tick_count = 1;
-                first_tick_us = now_us;
+                first_tick_us = now;
             }
             break;
+        }
 
-        case 0xFA: // Start
+        case 0xFA: { // Start
+            // Align Link beat 0 to this instant. request (not force) so peers
+            // get a phase-aligned transition at the next beat boundary instead
+            // of an instant yank; solo session is identical to immediate force.
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
+            uint64_t now = abl_link_clock_micros(s->link);
             abl_link_capture_app_session_state(s->link, midi_in_ss);
-            abl_link_set_is_playing(midi_in_ss, true, abl_link_clock_micros(s->link));
+            abl_link_set_is_playing(midi_in_ss, true, now);
+            abl_link_request_beat_at_time(midi_in_ss, 0.0, (int64_t)now, 1.0);
             abl_link_commit_app_session_state(s->link, midi_in_ss);
             tick_count = 0;
             break;
+        }
 
         case 0xFB: // Continue
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
@@ -836,7 +927,7 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
         }
         if (httpd_query_key_value(buf, "ppqn", val, sizeof(val)) == ESP_OK) {
             int p = atoi(val);
-            if (p >= 0 && p <= 2) {
+            if (p >= 0 && p < cv_ppqn_count) {
                 cv_ppqn_idx = p;
                 cv_ppqn = cv_ppqn_options[p];
             }
@@ -880,16 +971,13 @@ static esp_err_t get_handler(httpd_req_t *req) {
             "<a href='/set_mode?mode=%d' class='mbtn' style='%s'>%s</a>", i, sel, mode_names[i]);
     }
 
-    // Pre-build PPQN buttons HTML
-    char ppqn_btns[384];
-    int ppos = 0;
+    // Pre-build PPQN cycle button HTML — single button advances to the next option
+    char ppqn_btns[256];
     int cur_ppqn_idx = cv_ppqn_idx;
-    static const char *ppqn_labels[] = { "1", "4", "24" };
-    for (int i = 0; i < 3; i++) {
-        const char *sel = (i == cur_ppqn_idx) ? "background:#E64833;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
-        ppos += snprintf(ppqn_btns + ppos, sizeof(ppqn_btns) - ppos,
-            "<a href='/set_mode?ppqn=%d' class='mbtn' style='%s'>%s</a>", i, sel, ppqn_labels[i]);
-    }
+    int next_ppqn_idx = (cur_ppqn_idx + 1) % cv_ppqn_count;
+    snprintf(ppqn_btns, sizeof(ppqn_btns),
+        "<a href='/set_mode?ppqn=%d' class='mbtn' style='background:#E64833;color:#FBE9D0;'>%s</a>",
+        next_ppqn_idx, ppqn_labels[cur_ppqn_idx]);
 
     // Metronome toggle button
     char metro_btn[128];
@@ -1123,15 +1211,10 @@ static void visual_task(void *param) {
                             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
                             metro_off_time = 0;
                         }
-                    } else {
-                        // PPQN buttons (row 2)
-                        for (int i = 0; i < 3; i++) {
-                            if (tx >= ppqn_btn_x[i] && tx < ppqn_btn_x[i] + ppqn_btn_w[i]) {
-                                cv_ppqn_idx = i;
-                                cv_ppqn = cv_ppqn_options[i];
-                                break;
-                            }
-                        }
+                    } else if (tx >= ppqn_btn_x && tx < ppqn_btn_x + ppqn_btn_w) {
+                        // PPQN cycle button (row 2): advance to next option
+                        cv_ppqn_idx = (cv_ppqn_idx + 1) % cv_ppqn_count;
+                        cv_ppqn = cv_ppqn_options[cv_ppqn_idx];
                     }
                     last_touch = esp_log_timestamp();
                 }
@@ -1237,18 +1320,14 @@ static void visual_task(void *param) {
                 tft->setTextColor(fg);
                 tft->drawString(mode_labels[i], mode_btn_x[i] + mode_btn_w[i] / 2, 117);
             }
-            // Row 2: PPQN label + buttons (y=150, h=28), right-aligned
+            // Row 2: PPQN label + single cycling button (y=150, h=28), right-aligned
             tft->setTextSize(1);
             tft->setTextColor(C_VINTAGE_CREAM_DIM);
-            tft->drawString("PPQN", 186, 164);
+            tft->drawString("PPQN", 210, 164);
             tft->setTextSize(2);
-            for (int i = 0; i < 3; i++) {
-                uint16_t bg = (i == cv_ppqn_idx) ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT;
-                uint16_t fg = (i == cv_ppqn_idx) ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
-                tft->fillRoundRect(ppqn_btn_x[i], 150, ppqn_btn_w[i], 28, 4, bg);
-                tft->setTextColor(fg);
-                tft->drawString(ppqn_labels[i], ppqn_btn_x[i] + ppqn_btn_w[i] / 2, 164);
-            }
+            tft->fillRoundRect(ppqn_btn_x, 150, ppqn_btn_w, 28, 4, C_VINTAGE_AMBER);
+            tft->setTextColor(C_VINTAGE_CREAM);
+            tft->drawString(ppqn_labels[cv_ppqn_idx], ppqn_btn_x + ppqn_btn_w / 2, 164);
             tft->setTextDatum(top_left);
             last_midi_mode = midi_mode;
             last_cv_ppqn = cv_ppqn;
@@ -1290,9 +1369,9 @@ static void visual_task(void *param) {
                 tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
                 tft->setTextSize(1);
                 tft->setTextDatum(top_left);
-                tft->setTextColor(C_VINTAGE_CREAM);
+                tft->setTextColor(TFT_WHITE);
                 tft->drawString(l1, 22, 148);
-                tft->setTextColor(C_VINTAGE_CREAM_DIM);
+                tft->setTextColor(TFT_WHITE);
                 tft->drawString(l2, 22, 162);
                 last_mon_seq = cur_seq;
                 last_mon_led = led_on;

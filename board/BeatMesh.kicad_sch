@@ -4803,6 +4803,18 @@
 		)
 		(uuid "dfc5b60d-88b2-4da3-b410-74992230ff18")
 	)
+	(text "TODO: PIN 1 AND 3 should be reversed"
+		(exclude_from_sim no)
+		(at 18.542 90.17 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(color 255 141 0 1)
+			)
+			(justify left)
+		)
+		(uuid "ef429caa-1fc5-4fc6-891d-9499d02bcb20")
+	)
 	(junction
 		(at 195.58 45.72)
 		(diameter 0)
@@ -5246,6 +5258,16 @@
 			(type default)
 		)
 		(uuid "1bef4e71-fcad-4a3c-b94f-b8d4d6a24bc9")
+	)
+	(wire
+		(pts
+			(xy -27.94 90.17) (xy -10.16 90.17)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1bf1b3d7-2dd5-4b0a-9c61-3c1af7d6bf19")
 	)
 	(wire
 		(pts
@@ -6009,6 +6031,16 @@
 	)
 	(wire
 		(pts
+			(xy -52.07 85.09) (xy -38.1 85.09)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6dc25dff-5c3c-404b-8c5e-956fd553785b")
+	)
+	(wire
+		(pts
 			(xy 67.31 60.96) (xy 67.31 39.37)
 		)
 		(stroke
@@ -6069,6 +6101,16 @@
 	)
 	(wire
 		(pts
+			(xy -27.94 85.09) (xy -10.16 85.09)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "790ab2f2-6a6a-4677-9a15-7c84a1235a25")
+	)
+	(wire
+		(pts
 			(xy 127 26.67) (xy 127 33.02)
 		)
 		(stroke
@@ -6106,6 +6148,16 @@
 			(type default)
 		)
 		(uuid "7ab708a6-b6b1-45aa-9525-425e3cc3cead")
+	)
+	(wire
+		(pts
+			(xy -52.07 90.17) (xy -38.1 90.17)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "7b3f4db2-f502-4208-8eb8-c38c1e9a598a")
 	)
 	(wire
 		(pts
@@ -6626,6 +6678,16 @@
 			(type default)
 		)
 		(uuid "ae8f2fe5-a5fb-478f-8e68-021171e087fa")
+	)
+	(wire
+		(pts
+			(xy -52.07 95.25) (xy -38.1 95.25)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b068754e-d7af-4382-bb77-7add4cd47e31")
 	)
 	(wire
 		(pts
@@ -7317,6 +7379,16 @@
 		)
 		(uuid "3a8ff578-896e-4eb6-8961-79b78004221b")
 	)
+	(label "MIDI_OUT"
+		(at -52.07 90.17 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "3c734756-0ac2-47b6-ba64-53a386d36819")
+	)
 	(label "IO27_CV_PLAYSTOP"
 		(at 217.17 134.62 0)
 		(effects
@@ -7396,6 +7468,16 @@
 			(justify left bottom)
 		)
 		(uuid "7f1c563b-16ab-45fe-a025-bf6e35e7e6af")
+	)
+	(label "MIDI_IN"
+		(at -52.07 85.09 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "7f24bcba-fefc-49ee-97ba-43016fd5874d")
 	)
 	(label "ESP32_3.3V"
 		(at 196.85 36.83 0)
@@ -7487,6 +7569,16 @@
 		)
 		(uuid "94aa412e-eb19-4142-89b2-4b26c449c30b")
 	)
+	(label "ESP32_RX"
+		(at -20.32 90.17 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "98d47a86-4f63-4041-8b5a-23eea4a1268e")
+	)
 	(label "IO35"
 		(at 203.2 45.72 0)
 		(effects
@@ -7527,6 +7619,16 @@
 		)
 		(uuid "c8105838-ab9a-4445-bcd0-fc4c35c2b17a")
 	)
+	(label "MIDI_IN"
+		(at -20.32 85.09 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "dd3f5eac-7a9e-46ca-9c1f-ef82c58945c7")
+	)
 	(label "SLEEVE"
 		(at 121.92 133.35 0)
 		(effects
@@ -7536,6 +7638,16 @@
 			(justify left bottom)
 		)
 		(uuid "e3c3452a-d207-4f6b-98b3-62a71a9bd30d")
+	)
+	(label "ESP32_TX"
+		(at -52.07 95.25 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "fdf98cec-2430-4f74-831e-bca18cf702ed")
 	)
 	(label "IO35"
 		(at 262.89 38.1 0)
@@ -15657,6 +15769,99 @@
 			(project "BeatMesh"
 				(path "/14ea9578-4898-4ef4-b762-ae0714ccfadc"
 					(reference "R8")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Switch:SW_Slide_DPDT")
+		(at -33.02 90.17 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "cbe75fe7-179d-4d44-8bc5-3cf6740a2185")
+		(property "Reference" "SW2"
+			(at -33.02 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "SW_Slide_DPDT"
+			(at -33.02 82.55 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" "Button_Switch_THT:SW_E-Switch_EG2219_DPDT_Angled"
+			(at -19.05 85.09 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at -33.02 90.17 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Slide Switch, dual pole double throw"
+			(at -33.02 90.17 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "4"
+			(uuid "623b8a1f-24fd-46cf-bb08-ab87edc16492")
+		)
+		(pin "5"
+			(uuid "6bef5386-5da7-4bca-87bb-9da9a59b534f")
+		)
+		(pin "2"
+			(uuid "a7c89d3c-a648-4b7b-bc9d-c3da5393cd63")
+		)
+		(pin "6"
+			(uuid "e0b4fc01-3f2b-4c07-a72a-34db3f13a645")
+		)
+		(pin "3"
+			(uuid "673623a9-9ed9-4566-ae7e-80fb2367461b")
+		)
+		(pin "1"
+			(uuid "08a92ec4-74b4-488e-abb6-c234818aeba9")
+		)
+		(instances
+			(project "BeatMesh"
+				(path "/14ea9578-4898-4ef4-b762-ae0714ccfadc"
+					(reference "SW2")
 					(unit 1)
 				)
 			)

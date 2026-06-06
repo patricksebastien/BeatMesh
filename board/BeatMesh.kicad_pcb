@@ -32,6 +32,7 @@
 		(41 "User.2" user)
 		(43 "User.3" user)
 		(45 "User.4" user)
+		(49 "User.6" user)
 	)
 	(setup
 		(pad_to_mask_clearance 0)
@@ -46658,6 +46659,59 @@
 		(locked yes)
 		(layer "Edge.Cuts")
 		(uuid "f1cc8d7d-8d30-482c-9a42-ceb1331c2aa2")
+	)
+	(gr_line
+		(start 95.55065 48.8498)
+		(end 95.55065 148.8498)
+		(stroke
+			(width 0.1)
+			(type default)
+		)
+		(layer "User.6")
+		(uuid "ae29e5f9-d99a-4c57-82e0-f43d7748700f")
+	)
+	(gr_line
+		(start 95.55065 48.8498)
+		(end 195.55065 48.8498)
+		(stroke
+			(width 0.1)
+			(type default)
+		)
+		(layer "User.6")
+		(uuid "d73a0ead-ed25-4175-90ef-cf6d7e6cb755")
+	)
+	(gr_line
+		(start 195.55065 48.8498)
+		(end 195.55065 148.8498)
+		(stroke
+			(width 0.1)
+			(type default)
+		)
+		(layer "User.6")
+		(uuid "a20e1869-a552-4209-add8-750c4e119010")
+	)
+	(gr_line
+		(start 195.55065 148.8498)
+		(end 95.55065 148.8498)
+		(stroke
+			(width 0.1)
+			(type default)
+		)
+		(layer "User.6")
+		(uuid "236964d6-fbc3-46ed-89e2-8f1b98cd7261")
+	)
+	(gr_text "wrong: int <-> thru"
+		(at 90.55065 63.4498 0)
+		(layer "B.Cu")
+		(uuid "3aa952ee-2260-4cd1-8427-6b2aa4b1bd6e")
+		(effects
+			(font
+				(size 1.5 1.5)
+				(thickness 0.3)
+				(bold yes)
+			)
+			(justify left bottom mirror)
+		)
 	)
 	(gr_text "v1 - 02/2026"
 		(at 174.95065 148.0498 0)
