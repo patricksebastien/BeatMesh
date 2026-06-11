@@ -8,8 +8,10 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 
 - **10x MIDI Out ports**
 - **Flexible Routing:** Send raw MIDI to all 10 outputs OR filter to keep only the MIDI clock.
-- **CV Integration:** CV clock, reset, and play-stop outputs.
+- **CV Integration:** CV clock and reset outputs.
 - **Ableton Link:** Synchronize seamlessly over WiFi.
+- **OTA Firmware Updates:** Upload new firmware (`.bin`) directly from the web portal — no cable needed.
+- **Easy Soldering:** All through-hole components, beginner-friendly assembly.
 
 [![Schematic](board/schematic.png)](board/schematic.pdf)
 
