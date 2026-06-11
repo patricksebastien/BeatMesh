@@ -16,7 +16,15 @@ CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 # ----------------------------------------------------------------------
 # Use "Single Factory App, No OTA" layout.
 # This gives ~3MB to the app, needed for ASIO + Link + LovyanGFX.
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+#CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Custom OTA layout: two ~1.94MB app slots (ota_0/ota_1) for web firmware update.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="ota_4mb.csv"
+
+# Rollback: a new OTA image must call esp_ota_mark_app_valid_cancel_rollback()
+# after a successful boot, otherwise the bootloader reverts to the previous slot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Enable C++ Exceptions & RTTI (REQUIRED for ASIO/Link to work)
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
