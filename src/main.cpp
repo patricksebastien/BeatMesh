@@ -18,7 +18,9 @@
 #include "lwip/sockets.h"
 #include "abl_link.h"
 #include "esp_private/esp_clk.h"
-#include "esp_heap_caps.h" 
+#include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "mdns.h"
 
 // --- LovyanGFX Configuration (CYD) ---
 #define LGFX_USE_V1
@@ -80,7 +82,14 @@ static EventGroupHandle_t wifi_event_group;
 static bool s_is_connected = false;
 static bool s_portal_active = false;
 static int s_retry_num = 0;
-static char s_ssid_name[33] = {0}; 
+static char s_ssid_name[33] = {0};
+static char s_ip_str[16] = {0};            // STA IP, shown on TFT + web UI
+static httpd_handle_t s_http_server = NULL; // web server runs in AP portal and STA mode
+
+// Firmware version string; GIT_VERSION is injected at build time (git_version.py)
+#ifndef GIT_VERSION
+#define GIT_VERSION "unknown"
+#endif
 
 // --- Color Macros ---
 #define C_VINTAGE_BG      tft->color565(36, 72, 85)
@@ -917,6 +926,74 @@ static esp_err_t save_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// --- OTA firmware update: raw .bin POST body streamed into the inactive app slot ---
+static esp_err_t update_post_handler(httpd_req_t *req) {
+    const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    if (update_part == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "ERROR: no OTA partition available");
+        return ESP_OK;
+    }
+    if (req->content_len == 0 || req->content_len > update_part->size) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "ERROR: image is empty or larger than the OTA slot");
+        return ESP_OK;
+    }
+
+    char *buf = (char *)malloc(4096);
+    if (buf == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "ERROR: out of memory");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "OTA: receiving %u bytes into '%s'", (unsigned)req->content_len, update_part->label);
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t err = ESP_OK;
+    size_t remaining = req->content_len;
+    bool started = false;
+    int timeouts = 0;
+
+    while (remaining > 0) {
+        int r = httpd_req_recv(req, buf, remaining < 4096 ? remaining : 4096);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5) continue;
+        if (r <= 0) { err = ESP_FAIL; break; }
+        timeouts = 0;
+        if (!started) {
+            // Every ESP32 app image starts with magic byte 0xE9 — reject anything else
+            if ((uint8_t)buf[0] != 0xE9) { err = ESP_ERR_INVALID_ARG; break; }
+            err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+            if (err != ESP_OK) break;
+            started = true;
+        }
+        err = esp_ota_write(ota, buf, r);
+        if (err != ESP_OK) break;
+        remaining -= r;
+    }
+    free(buf);
+
+    if (err == ESP_OK && started) err = esp_ota_end(ota); // validates the written image
+    else if (started) esp_ota_abort(ota);
+
+    if (err == ESP_OK) err = esp_ota_set_boot_partition(update_part);
+
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "OTA: update OK, rebooting into '%s'", update_part->label);
+        httpd_resp_sendstr(req, "OK: firmware flashed, rebooting...");
+        vTaskDelay(pdMS_TO_TICKS(1000)); // let the response reach the browser
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "OTA: update failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "ERROR: update failed, current firmware kept");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t set_mode_handler(httpd_req_t *req) {
     char buf[128];
     if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
@@ -949,7 +1026,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
     bool is_playing = abl_link_is_playing(g_web_ss);
     size_t peers = abl_link_num_peers(g_link_state.link);
 
-    char html_buf[4352];
+    char html_buf[7168];
     const char* play_style = is_playing ? "border:2px solid #FFF;" : "";
     const char* stop_style = !is_playing ? "border:2px solid #FFF;" : "";
 
@@ -987,12 +1064,15 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "<a href='/set_mode?metro=%d' class='mbtn' style='%s'>%s</a>", cur_metro ? 0 : 1, metro_style, cur_metro ? "ON" : "OFF");
 
     // Connection status
-    char conn_str[64];
+    char conn_str[80];
     if (s_is_connected) {
-        snprintf(conn_str, sizeof(conn_str), "LINK: %s", s_ssid_name);
+        snprintf(conn_str, sizeof(conn_str), "LINK: %s (%s)", s_ssid_name, s_ip_str);
     } else {
         snprintf(conn_str, sizeof(conn_str), "AP Mode");
     }
+
+    // Running OTA slot label, shown on the firmware card
+    const esp_partition_t *running_part = esp_ota_get_running_partition();
 
     double bpm_minus = current_bpm - 1.0;
     double bpm_plus = current_bpm + 1.0;
@@ -1052,18 +1132,82 @@ static esp_err_t get_handler(httpd_req_t *req) {
                     "<input type='submit' class='btn' value='CONNECT'>"
                 "</form>"
             "</div>"
-        "</div></body></html>",
+            "<div class='card'>"
+                "<h2>FIRMWARE UPDATE</h2>"
+                "<p style='font-size:12px;color:#90AEAD;margin:0 0 10px 0'>version: %s &bull; running slot: %s</p>"
+                "<input type='file' id='fw' accept='.bin'>"
+                "<button class='btn' id='fwbtn' onclick='fwUp()'>UPLOAD &amp; FLASH</button>"
+                "<p id='fwst' style='font-size:14px;font-weight:bold'></p>"
+            "</div>"
+        "</div>"
+        "<script>"
+        "function fwUp(){var f=document.getElementById('fw').files[0];var st=document.getElementById('fwst');"
+        "if(!f){st.innerText='Choose a .bin file first';return;}"
+        "if(!confirm('Flash '+f.name+' ('+Math.round(f.size/1024)+' KB)? The device reboots when done.'))return;"
+        "document.getElementById('fwbtn').disabled=true;"
+        "var x=new XMLHttpRequest();x.open('POST','/update');"
+        "x.upload.onprogress=function(e){st.innerText='Uploading: '+Math.round(e.loaded*100/e.total)+'%%';};"
+        "x.onload=function(){st.innerText=x.responseText;if(x.status!=200){document.getElementById('fwbtn').disabled=false;}};"
+        "x.onerror=function(){st.innerText='Connection closed (device may be rebooting)';};"
+        "x.send(f);}"
+        "</script>"
+        "</body></html>",
         peers, conn_str,
         mode_btns, ppqn_btns, metro_btn,
         midi_banner,
         bpm_minus, midi_is_master ? " off" : "", current_bpm, disabled, bpm_plus, midi_is_master ? " off" : "",
         disabled,
-        play_style, disabled, stop_style, disabled
+        play_style, disabled, stop_style, disabled,
+        GIT_VERSION, running_part ? running_part->label : "?"
     );
 
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, html_buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+// --- Web server: shared by the AP captive portal and STA mode (remote control + OTA) ---
+static void start_web_server() {
+    if (s_http_server != NULL) return;
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;
+    config.lru_purge_enable = true;
+    config.stack_size = 12288; // get_handler builds the page in a ~7KB stack buffer
+
+    if (httpd_start(&s_http_server, &config) == ESP_OK) {
+        httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = get_handler };
+        httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
+        httpd_uri_t save = { .uri = "/save", .method = HTTP_GET, .handler = save_handler };
+        httpd_uri_t set_bpm = { .uri = "/set_bpm", .method = HTTP_GET, .handler = set_bpm_handler };
+        httpd_uri_t transport = { .uri = "/transport", .method = HTTP_GET, .handler = set_transport_handler };
+        httpd_uri_t set_mode = { .uri = "/set_mode", .method = HTTP_GET, .handler = set_mode_handler };
+        httpd_uri_t update = { .uri = "/update", .method = HTTP_POST, .handler = update_post_handler };
+        httpd_uri_t connecttest = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = aggressive_close_handler };
+        httpd_uri_t redirect = { .uri = "/redirect", .method = HTTP_GET, .handler = captive_portal_redirect };
+        httpd_uri_t hotspot = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_portal_redirect };
+        httpd_uri_t gen204 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_portal_redirect };
+
+        httpd_register_uri_handler(s_http_server, &root);
+        httpd_register_uri_handler(s_http_server, &favicon);
+        httpd_register_uri_handler(s_http_server, &save);
+        httpd_register_uri_handler(s_http_server, &set_bpm);
+        httpd_register_uri_handler(s_http_server, &transport);
+        httpd_register_uri_handler(s_http_server, &set_mode);
+        httpd_register_uri_handler(s_http_server, &update);
+        httpd_register_uri_handler(s_http_server, &connecttest);
+        httpd_register_uri_handler(s_http_server, &redirect);
+        httpd_register_uri_handler(s_http_server, &hotspot);
+        httpd_register_uri_handler(s_http_server, &gen204);
+
+        httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND, custom_error_handler);
+        httpd_register_err_handler(s_http_server, HTTPD_400_BAD_REQUEST, custom_error_handler);
+        httpd_register_err_handler(s_http_server, HTTPD_500_INTERNAL_SERVER_ERROR, custom_error_handler);
+
+        ESP_LOGW(TAG, "Web server started");
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+    }
 }
 
 // --- Start Access Point + Captive Portal ---
@@ -1086,54 +1230,18 @@ void start_setup_portal() {
     // Start DNS hijacker for captive portal redirect (Core 0 with WiFi)
     xTaskCreatePinnedToCore(dns_hijacker_task, "dns", 4096, NULL, 5, NULL, 0);
 
-    // Start HTTP server
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;
-    config.lru_purge_enable = true;
-    config.stack_size = 8192;
-
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = get_handler };
-        httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
-        httpd_uri_t save = { .uri = "/save", .method = HTTP_GET, .handler = save_handler };
-        httpd_uri_t set_bpm = { .uri = "/set_bpm", .method = HTTP_GET, .handler = set_bpm_handler };
-        httpd_uri_t transport = { .uri = "/transport", .method = HTTP_GET, .handler = set_transport_handler };
-        httpd_uri_t set_mode = { .uri = "/set_mode", .method = HTTP_GET, .handler = set_mode_handler };
-        httpd_uri_t connecttest = { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = aggressive_close_handler };
-        httpd_uri_t redirect = { .uri = "/redirect", .method = HTTP_GET, .handler = captive_portal_redirect };
-        httpd_uri_t hotspot = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_portal_redirect };
-        httpd_uri_t gen204 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_portal_redirect };
-
-        httpd_register_uri_handler(server, &root);
-        httpd_register_uri_handler(server, &favicon);
-        httpd_register_uri_handler(server, &save);
-        httpd_register_uri_handler(server, &set_bpm);
-        httpd_register_uri_handler(server, &transport);
-        httpd_register_uri_handler(server, &set_mode);
-        httpd_register_uri_handler(server, &connecttest);
-        httpd_register_uri_handler(server, &redirect);
-        httpd_register_uri_handler(server, &hotspot);
-        httpd_register_uri_handler(server, &gen204);
-
-        httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, custom_error_handler);
-        httpd_register_err_handler(server, HTTPD_400_BAD_REQUEST, custom_error_handler);
-        httpd_register_err_handler(server, HTTPD_500_INTERNAL_SERVER_ERROR, custom_error_handler);
-
-        ESP_LOGW(TAG, "AP Started: BeatMesh - Portal at 192.168.4.1");
-    } else {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
-    }
+    start_web_server();
+    ESP_LOGW(TAG, "AP Started: BeatMesh - Portal at 192.168.4.1");
 }
 
 // --- Help screens ---
 #define HELP_PAGE_COUNT 4
 enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1 };
 
-// Firmware version string; GIT_VERSION is injected at build time (git_version.py)
-#ifndef GIT_VERSION
-#define GIT_VERSION "unknown"
-#endif
+// GIT_VERSION define moved to the top globals (also used by the web UI firmware card)
+//#ifndef GIT_VERSION
+//#define GIT_VERSION "unknown"
+//#endif
 
 // Draw the static main-screen chrome: transport buttons (row 0) + HELP button (row 2).
 static void draw_main_chrome(void) {
@@ -1565,8 +1673,8 @@ static void visual_task(void *param) {
             } else if (s_is_connected) {
                 tft->fillRect(0, 215, 320, 25, C_VINTAGE_CREAM);
                 tft->setTextColor(C_VINTAGE_BG); tft->setTextSize(2);
-                char status_msg[64];
-                snprintf(status_msg, sizeof(status_msg), "LINK: %s", s_ssid_name);
+                char status_msg[80];
+                snprintf(status_msg, sizeof(status_msg), "LINK: %s (%s)", s_ssid_name, s_ip_str);
                 tft->drawCenterString(status_msg, 160, 220);
             } else if (s_portal_active) {
                 tft->fillRect(0, 215, 320, 25, C_VINTAGE_CREAM);
@@ -1594,6 +1702,8 @@ static void event_handler(void* arg, esp_event_base_t base, int32_t id, void* da
             start_setup_portal();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         s_is_connected = true;
         s_retry_num = 0;
         wifi_config_t conf;
@@ -1617,10 +1727,16 @@ extern "C" void app_main(void) {
     esp_netif_create_default_wifi_sta(); 
     esp_netif_create_default_wifi_ap();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); 
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
+
+    // mDNS: device reachable at http://beatmesh.local on the LAN
+    mdns_init();
+    mdns_hostname_set("beatmesh");
+    mdns_instance_name_set("BeatMesh");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
 
     g_link_state.link = abl_link_create(120.0);
     g_link_state.session_state = abl_link_create_session_state();
@@ -1648,5 +1764,14 @@ extern "C" void app_main(void) {
     wifi_config_t sta_cfg;
     esp_wifi_get_config(WIFI_IF_STA, &sta_cfg);
     if (strlen((char*)sta_cfg.sta.ssid) == 0) start_setup_portal();
-    else { esp_wifi_set_mode(WIFI_MODE_STA); esp_wifi_start(); esp_wifi_set_ps(WIFI_PS_NONE); }
+    else {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        start_web_server(); // web UI + OTA also available on the home network
+    }
+
+    // Init reached the end without crashing: confirm this image as good so the
+    // bootloader won't roll back to the previous OTA slot on next reboot.
+    esp_ota_mark_app_valid_cancel_rollback();
 }
