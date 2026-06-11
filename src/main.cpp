@@ -96,8 +96,8 @@ static char s_ssid_name[33] = {0};
 // --- Mode/PPQN button layout (y=100, h=40) ---
 static const int mode_btn_x[] = { 10, 86, 162, 238 };
 static const int mode_btn_w[] = { 71, 71, 71, 72 };
-static const int ppqn_btn_x = 246;   // single cycling button (tap to advance)
-static const int ppqn_btn_w = 62;
+static const int ppqn_btn_x = 162;   // single cycling button (tap to advance), right after METRONOME
+static const int ppqn_btn_w = 71;
 static const char *mode_labels[] = { "LINK", "MIDI", "THR", "CV" };
 static const char *ppqn_labels[] = { "1", "2", "4", "8", "24", "48" };
 
@@ -122,8 +122,8 @@ static volatile bool metronome_enabled = false;
 
 // --- MIDI Monitor (small UI box, left of metronome button) ---
 static portMUX_TYPE g_mon_mux = portMUX_INITIALIZER_UNLOCKED;
-static char g_midi_mon_l1[10] = "";
-static char g_midi_mon_l2[12] = "";
+static char g_midi_mon_l1[10] = "MONITOR:";
+static char g_midi_mon_l2[12] = "No midi in";
 static volatile uint32_t g_midi_mon_seq = 0;
 static volatile int64_t g_midi_mon_last_us = 0;
 // Parser running-status state (only touched by midi_in_task)
@@ -1126,6 +1126,137 @@ void start_setup_portal() {
     }
 }
 
+// --- Help screens ---
+#define HELP_PAGE_COUNT 4
+enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1 };
+
+// Firmware version string; GIT_VERSION is injected at build time (git_version.py)
+#ifndef GIT_VERSION
+#define GIT_VERSION "unknown"
+#endif
+
+// Draw the static main-screen chrome: transport buttons (row 0) + HELP button (row 2).
+static void draw_main_chrome(void) {
+    tft->setTextSize(2);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextDatum(middle_center);
+    tft->fillRoundRect(10, 10, 70, 50, 5, C_VINTAGE_RUST);
+    tft->fillRect(35, 25, 20, 20, C_VINTAGE_CREAM);
+    tft->fillRoundRect(90, 10, 70, 50, 5, C_VINTAGE_FERN);
+    tft->fillTriangle(115, 25, 115, 45, 135, 35, TFT_WHITE);
+    tft->fillRoundRect(170, 10, 65, 50, 5, C_VINTAGE_AMBER);
+    tft->drawString("-", 202, 35);
+    tft->fillRoundRect(245, 10, 65, 50, 5, C_VINTAGE_AMBER);
+    tft->drawString("+", 277, 35);
+    // HELP button (row 2, right after the PPQN button)
+    tft->fillRoundRect(240, 150, 71, 28, 4, C_VINTAGE_RUST);
+    tft->setTextSize(1);
+    tft->drawString("HELP", 240 + 71 / 2, 164);
+    tft->setTextDatum(top_left);
+}
+
+// Draw one full-screen help page. NEXT is hidden on the last page.
+static void draw_help_page(int page) {
+    tft->fillScreen(C_VINTAGE_BG);
+    tft->setTextDatum(middle_center);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    // BACK button (bottom-left) -> returns to main UI
+    tft->fillRoundRect(10, 208, 52, 24, 4, C_VINTAGE_RUST);
+    tft->drawString("BACK", 10 + 52 / 2, 220);
+    // NEXT button (bottom-right) -> advance page; absent on the last page
+    if (page < HELP_PAGE_COUNT - 1) {
+        tft->fillRoundRect(258, 208, 52, 24, 4, C_VINTAGE_FERN);
+        tft->drawString("NEXT", 258 + 52 / 2, 220);
+    }
+    tft->setTextDatum(top_left);
+    tft->setTextSize(1.7);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    if (page == 0) {
+        // Up / down arrowhead triangles (top-center / bottom-center)
+        tft->fillTriangle(160, 12, 148, 32, 172, 32, C_VINTAGE_CREAM);    // up
+        tft->fillTriangle(160, 228, 148, 208, 172, 208, C_VINTAGE_CREAM); // down
+        // Left / right arrowheads, lowered to leave room for the top info
+        tft->fillTriangle(12, 150, 32, 138, 32, 162, C_VINTAGE_CREAM);    // left
+        tft->fillTriangle(308, 150, 288, 138, 288, 162, C_VINTAGE_CREAM); // right
+        // Top arrow label (single lines, just below the up arrow)
+        tft->setTextDatum(middle_center);
+        tft->drawString("Switch: midi bypass BeatMesh", 160, 50);
+        tft->drawString("CV clock in", 160, 70);
+        tft->drawString("midi in 1/8 | midi in din", 160, 90);
+        // Left arrow label (right of the arrow)
+        tft->setTextDatum(middle_left);
+        tft->drawString("5 midi out", 40, 150);
+        // Right arrow label (left of the arrow)
+        tft->setTextDatum(middle_right);
+        tft->drawString("5 midi out", 280, 150);
+        // Bottom arrow label (above the down arrow)
+        tft->setTextDatum(middle_center);
+        tft->drawString("CV out, CV reset", 160, 190);
+        tft->setTextDatum(top_left);
+    } else if (page == 1) {
+        // Mode descriptions (wrapped to fit) with subtle separators between modes
+        const int px = 16; // left padding
+        tft->setTextDatum(top_left);
+        tft->setTextColor(C_VINTAGE_CREAM);
+        tft->setTextSize(1.7);
+        tft->drawString("Clock", px, 10);
+        tft->setTextSize(1.2);
+        tft->drawString("Link: clock controlled by ableton link", px, 38);
+        tft->drawFastHLine(px, 55, 288, C_VINTAGE_BG_LT);
+        tft->drawString("Midi: clock using midi in and filtering", px, 61);
+        tft->drawString("out any other midi signal", px, 75);
+        tft->drawFastHLine(px, 91, 288, C_VINTAGE_BG_LT);
+        tft->drawString("THR: clock using midi in but send also", px, 97);
+        tft->drawString("all midi signal", px, 111);
+        tft->drawFastHLine(px, 127, 288, C_VINTAGE_BG_LT);
+        tft->drawString("CV: clock using CV in.", px, 133);
+        tft->setTextSize(1.5);
+        tft->drawString("Clock sent to 10 midi out and", px, 161);
+        tft->drawString("cv clock out.", px, 181);
+    } else if (page == 2) {
+        // Web interface / access point info
+        const int px = 16; // left padding
+        tft->setTextDatum(top_left);
+        tft->setTextColor(C_VINTAGE_CREAM);
+        tft->setTextSize(1.7);
+        tft->drawString("Web interface", px, 14);
+        tft->setTextSize(1.2);
+        tft->drawString("To configure wifi and settings,", px, 42);
+        tft->drawString("join the 'BeatMesh' wifi access", px, 56);
+        tft->drawString("point, then open in a browser:", px, 70);
+        tft->setTextSize(2.5);
+        tft->drawString("192.168.4.1", px, 88);
+        tft->setTextSize(1.2);
+        tft->drawString("Access point mode works for up to", px, 126);
+        tft->drawString("2-4 peers; for more, connect all", px, 138);
+        tft->drawString("devices to a router.", px, 152);
+    } else {
+        // Credits / version
+        const int px = 16; // left padding
+        tft->setTextDatum(top_left);
+        tft->setTextColor(C_VINTAGE_CREAM);
+        tft->setTextSize(1.7);
+        tft->drawString("CREDITS", px, 8);
+        tft->setTextSize(1.2);
+        tft->drawString("THOMAS O. FREDERICKS", px, 32);
+        tft->drawString("(this circuit is inspired by!)", px, 45);
+        tft->drawString("visit: t-o-f.info", px, 58);
+        tft->drawString("Alexandre Castonguay", px, 76);
+        tft->drawString("(Technologie de la fete) and", px, 89);
+        tft->drawString("Andre Girard (for all the", px, 102);
+        tft->drawString("brainstorming!)", px, 115);
+        tft->setTextSize(1.5);
+        tft->drawString("Made with love by:", px, 137); // bigger + 4px margin-top
+        tft->setTextSize(1.2);
+        tft->drawString("Patrick Sebastien Coulombe", px, 155);
+        tft->drawString("workinprogress.ca", px, 168);
+        tft->setTextColor(TFT_WHITE);
+        tft->setTextDatum(bottom_right);
+        tft->drawString("version: " GIT_VERSION, 320 - px, 240 - 6);
+    }
+}
+
 // --- Visual & Link Task ---
 static void visual_task(void *param) {
     link_state_t *s = (link_state_t *)param;
@@ -1141,6 +1272,10 @@ static void visual_task(void *param) {
     int last_cv_ppqn = 0;
     uint32_t metro_off_time = 0;
     bool last_metro_enabled = true; // force initial draw (metronome starts disabled)
+    uint32_t last_mon_seq = 0xFFFFFFFFu; // MIDI monitor redraw tracker (force first draw)
+    bool last_mon_led = false;
+    int ui_screen = SCREEN_MAIN;        // active screen: main UI vs help
+    int help_page = 0;                  // active help page index
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -1152,20 +1287,20 @@ static void visual_task(void *param) {
     gpio_set_direction(BTN_BOOT, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BTN_BOOT, GPIO_PULLUP_ONLY);
 
-    tft->setTextSize(2);
-    tft->setTextColor(C_VINTAGE_CREAM);
-    tft->setTextDatum(middle_center);
-    tft->fillRoundRect(10, 10, 70, 50, 5, C_VINTAGE_RUST);
-    tft->fillRect(35, 25, 20, 20, C_VINTAGE_CREAM); 
-    tft->fillRoundRect(90, 10, 70, 50, 5, C_VINTAGE_FERN); 
-    tft->fillTriangle(115, 25, 115, 45, 135, 35, TFT_WHITE); 
-    tft->fillRoundRect(170, 10, 65, 50, 5, C_VINTAGE_AMBER);
-    tft->drawString("-", 202, 35);
-    tft->fillRoundRect(245, 10, 65, 50, 5, C_VINTAGE_AMBER);
-    tft->drawString("+", 277, 35);
+    draw_main_chrome();
 
-    // Mode + PPQN selector buttons (initial draw triggers via last_midi_mode/last_cv_ppqn mismatch)
-    tft->setTextDatum(top_left);
+    // Restore the main UI after leaving a help screen: redraw static chrome and
+    // force every change-tracked block below to repaint on the next iteration.
+    auto restore_main = [&]() {
+        tft->fillScreen(C_VINTAGE_BG);
+        draw_main_chrome();
+        last_beat = -1; last_bpm = -1; last_peers = 999;
+        last_midi_mode = -1; last_cv_ppqn = -1;
+        last_metro_enabled = !metronome_enabled;
+        last_connection_state = !s_is_connected;
+        last_portal_state = !s_portal_active;
+        last_mon_seq = 0xFFFFFFFFu;
+    };
 
     while (true) {
         // Metronome silence check
@@ -1189,6 +1324,19 @@ static void visual_task(void *param) {
         uint16_t tx, ty;
         if (tft->getTouch(&tx, &ty)) {
             if (esp_log_timestamp() - last_touch > 300) {
+              if (ui_screen == SCREEN_HELP) {
+                // BACK button (bottom-left) returns to the main UI
+                if (tx < 70 && ty >= 200) {
+                    ui_screen = SCREEN_MAIN;
+                    restore_main();
+                }
+                // NEXT button (bottom-right); absent on the last page
+                else if (help_page < HELP_PAGE_COUNT - 1 && tx >= 250 && ty >= 200) {
+                    help_page++;
+                    draw_help_page(help_page);
+                }
+                last_touch = esp_log_timestamp();
+              } else {
                 abl_link_capture_app_session_state(s->link, s->session_state);
                 uint64_t now = abl_link_clock_micros(s->link);
 
@@ -1203,7 +1351,7 @@ static void visual_task(void *param) {
                     last_touch = esp_log_timestamp();
                 }
                 else if (ty >= 150 && ty < 178) {
-                    if (tx >= 84 && tx < 166) {
+                    if (tx >= 84 && tx < 155) {
                         // MET toggle button
                         metronome_enabled = !metronome_enabled;
                         if (!metronome_enabled) {
@@ -1215,6 +1363,11 @@ static void visual_task(void *param) {
                         // PPQN cycle button (row 2): advance to next option
                         cv_ppqn_idx = (cv_ppqn_idx + 1) % cv_ppqn_count;
                         cv_ppqn = cv_ppqn_options[cv_ppqn_idx];
+                    } else if (tx >= 240 && tx < 311) {
+                        // HELP button (row 2, right of PPQN): open help screens
+                        ui_screen = SCREEN_HELP;
+                        help_page = 0;
+                        draw_help_page(help_page);
                     }
                     last_touch = esp_log_timestamp();
                 }
@@ -1243,9 +1396,16 @@ static void visual_task(void *param) {
                     tft->drawRoundRect(10, 10, 70, 50, 5, C_VINTAGE_BG); 
                     tft->drawRoundRect(90, 10, 70, 50, 5, C_VINTAGE_BG); 
                     tft->drawRoundRect(170, 10, 65, 50, 5, C_VINTAGE_BG); 
-                    tft->drawRoundRect(245, 10, 65, 50, 5, C_VINTAGE_BG); 
+                    tft->drawRoundRect(245, 10, 65, 50, 5, C_VINTAGE_BG);
                 }
+              }
             }
+        }
+
+        // Help screen is modal: skip all main-UI rendering while it is shown.
+        if (ui_screen != SCREEN_MAIN) {
+            vTaskDelay(pdMS_TO_TICKS(16));
+            continue;
         }
 
         abl_link_capture_app_session_state(s->link, s->session_state);
@@ -1293,41 +1453,42 @@ static void visual_task(void *param) {
             tft->fillRect(10, 176, 160, 35, C_VINTAGE_BG);
             tft->setTextColor(C_VINTAGE_CREAM); tft->setTextSize(4);
             char bstr[16]; sprintf(bstr, "%.0f", cur_bpm);
-            tft->drawString(bstr, 10, 181);
+            tft->drawString(bstr, 9, 180);
             tft->setTextSize(2);
-            tft->drawString("BPM", 92, 195);
+            tft->drawString("BPM", 92, 194);
             last_bpm = cur_bpm;
         }
 
         if (peers != last_peers || last_peers == 999) {
             tft->fillRect(180, 192, 140, 22, C_VINTAGE_BG);
-            tft->setTextColor(C_VINTAGE_SAGE); tft->setTextSize(2);
+            tft->setTextColor(C_VINTAGE_CREAM); tft->setTextSize(2);
             char pstr[20]; sprintf(pstr, "PEERS: %zu", peers);
-            tft->drawRightString(pstr, 310, 195);
+            tft->drawRightString(pstr, 310, 194);
             last_peers = peers;
         }
 
         // Mode + PPQN button redraw
         if (midi_mode != last_midi_mode || last_cv_ppqn != cv_ppqn) {
-            static const uint16_t mode_colors[] = { C_VINTAGE_FERN, C_VINTAGE_AMBER, C_VINTAGE_RUST, C_VINTAGE_SAGE };
+            static const uint16_t mode_colors[] = { C_VINTAGE_FERN, C_VINTAGE_FERN, C_VINTAGE_FERN, C_VINTAGE_FERN };
             // Row 1: Mode buttons (y=100, h=35)
             tft->setTextSize(2);
             tft->setTextDatum(middle_center);
             for (int i = 0; i < 4; i++) {
                 uint16_t bg = (i == midi_mode) ? mode_colors[i] : C_VINTAGE_BG_LT;
-                uint16_t fg = (i == midi_mode) ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
+                uint16_t fg = C_VINTAGE_CREAM; // always white text, even when inactive
                 tft->fillRoundRect(mode_btn_x[i], 100, mode_btn_w[i], 35, 5, bg);
                 tft->setTextColor(fg);
-                tft->drawString(mode_labels[i], mode_btn_x[i] + mode_btn_w[i] / 2, 117);
+                tft->drawString(mode_labels[i], mode_btn_x[i] + mode_btn_w[i] / 2, 118);
             }
-            // Row 2: PPQN label + single cycling button (y=150, h=28), right-aligned
-            tft->setTextSize(1);
-            tft->setTextColor(C_VINTAGE_CREAM_DIM);
-            tft->drawString("PPQN", 210, 164);
-            tft->setTextSize(2);
+            // Row 2: PPQN button (right after METRONOME) - small "PPQN" label + value inside
             tft->fillRoundRect(ppqn_btn_x, 150, ppqn_btn_w, 28, 4, C_VINTAGE_AMBER);
             tft->setTextColor(C_VINTAGE_CREAM);
-            tft->drawString(ppqn_labels[cv_ppqn_idx], ppqn_btn_x + ppqn_btn_w / 2, 164);
+            tft->setTextSize(1);
+            tft->setTextDatum(middle_left);
+            tft->drawString("PPQN", ppqn_btn_x + 6, 164);
+            tft->setTextSize(2);
+            tft->setTextDatum(middle_right);
+            tft->drawString(ppqn_labels[cv_ppqn_idx], ppqn_btn_x + ppqn_btn_w - 6, 164);
             tft->setTextDatum(top_left);
             last_midi_mode = midi_mode;
             last_cv_ppqn = cv_ppqn;
@@ -1336,20 +1497,18 @@ static void visual_task(void *param) {
         // METRONOME button redraw (left side of row 2)
         if (metronome_enabled != last_metro_enabled) {
             uint16_t bg = metronome_enabled ? C_VINTAGE_FERN : C_VINTAGE_BG_LT;
-            uint16_t fg = metronome_enabled ? C_VINTAGE_CREAM : C_VINTAGE_CREAM_DIM;
-            tft->fillRoundRect(84, 150, 80, 28, 4, bg);
+            uint16_t fg = C_VINTAGE_CREAM; // always white text, even when inactive
+            tft->fillRoundRect(84, 150, 71, 28, 4, bg);
             tft->setTextSize(1);
             tft->setTextColor(fg);
             tft->setTextDatum(middle_center);
-            tft->drawString("METRONOME", 124, 164);
+            tft->drawString("METRONOME", 119, 164);
             tft->setTextDatum(top_left);
             last_metro_enabled = metronome_enabled;
         }
 
         // MIDI monitor (left of metronome): activity LED + last message
         {
-            static uint32_t last_mon_seq = 0xFFFFFFFFu; // force first draw
-            static bool last_mon_led = false;
             char l1[10], l2[12];
             uint32_t cur_seq;
             int64_t last_us;
@@ -1365,18 +1524,19 @@ static void visual_task(void *param) {
             bool led_on = (last_us != 0) && ((esp_timer_get_time() - last_us) < 80000);
 
             if (cur_seq != last_mon_seq) {
+                // Two-line monitor label same color as button labels (LINK, MIDI...)
+                uint16_t mon_fg = C_VINTAGE_CREAM;
                 tft->fillRect(10, 146, 70, 28, C_VINTAGE_BG);
-                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
+                tft->fillRect(10, 145, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
                 tft->setTextSize(1);
                 tft->setTextDatum(top_left);
-                tft->setTextColor(TFT_WHITE);
-                tft->drawString(l1, 22, 148);
-                tft->setTextColor(TFT_WHITE);
-                tft->drawString(l2, 22, 162);
+                tft->setTextColor(mon_fg);
+                tft->drawString(l1, 22, 146);
+                tft->drawString(l2, 11, 160); // bottom line aligns with the LED's left edge
                 last_mon_seq = cur_seq;
                 last_mon_led = led_on;
             } else if (led_on != last_mon_led) {
-                tft->fillRect(11, 148, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
+                tft->fillRect(10, 145, 8, 8, led_on ? C_VINTAGE_AMBER : C_VINTAGE_BG_LT);
                 last_mon_led = led_on;
             }
         }
