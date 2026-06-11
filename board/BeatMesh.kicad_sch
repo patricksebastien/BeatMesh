@@ -4759,6 +4759,26 @@
 		)
 		(uuid "132f37dc-7613-4dcd-a5da-be96f5cb0d18")
 	)
+	(text "play - stop is now reset"
+		(exclude_from_sim no)
+		(at 294.386 34.544 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "34339371-2bb5-43df-9364-a9290d3d7136")
+	)
+	(text "io21 do not use, so we loose start-stop"
+		(exclude_from_sim no)
+		(at 300.228 29.464 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "49d60e63-7537-4b5a-b6e3-8f50048d182c")
+	)
 	(text "CV CLOCK IN"
 		(exclude_from_sim no)
 		(at 179.578 18.542 0)
