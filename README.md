@@ -27,13 +27,15 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 
 The repository includes a production-ready printed circuit board designed in **KiCad 10**. You can find the source files (`.kicad_sch` and `.kicad_pcb`) in the `board/` directory.
 
+<!-- V1 PCB errata (fixed on V2 boards):
 > ⚠️ **V1 PCB Errata:** The 2-pin power connector near the USB-C port has its silkscreen polarity printed incorrectly. The actual pinout is **GND, VCC** (not VCC, GND as silkscreened). Wire accordingly to avoid damage.
+-->
 
 ### Power & USB-C Assembly Notes*
 
 The board only draws 5V power from USB-C; no data lines are used. Two shortcuts make assembly easier:
 
-- **\*Skip the USB-C connector if you are new to soldering.** It is the only surface-mount part on the board; its pins are fine-pitch and tricky to solder by hand. Instead, cut an old USB cable, and solder its **VCC (red)** and **GND (black)** wires directly to the 2-pin power connector pads next to the USB-C footprint. Mind the polarity (see the V1 errata above).
+- **\*Skip the USB-C connector if you are new to soldering.** It is the only surface-mount part on the board; its pins are fine-pitch and tricky to solder by hand. Instead, cut an old USB cable, and solder its **VCC (red)** and **GND (black)** wires directly to the 2-pin power connector pads next to the USB-C footprint. Mind the polarity marked on the silkscreen.
 - **The 5.1kΩ resistors (R2, R3) are only needed for USB-C to USB-C.** They are the CC pull-downs that tell a USB-C power adapter or USB-C host to turn on 5V. If you power the board with a **USB-A to USB-C** cable (phone charger, computer port, power bank), 5V is always present on VBUS and R2/R3 can be left unpopulated. In that case only the **VBUS and GND** pins of the USB-C connector need to be soldered.
 
 ### Hardware Design Highlights:
