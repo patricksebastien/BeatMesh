@@ -10,8 +10,8 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 - **Flexible Routing:** Send raw MIDI to all 10 outputs OR filter to keep only the MIDI clock.
 - **CV Integration:** CV clock and reset outputs.
 - **Ableton Link:** Synchronize seamlessly over WiFi.
-- **OTA Firmware Updates:** Upload new firmware (`.bin`) directly from the web portal — no cable needed.
-- **Easy Soldering:** All through-hole components, beginner-friendly assembly.
+- **OTA Firmware Updates:** Upload new firmware (`.bin`) directly from the web portal, no cable needed.
+- **Easy Soldering:** All through-hole components (except USB-C, see below*), beginner-friendly assembly.
 
 [![Schematic](board/schematic.png)](board/schematic.pdf)
 
@@ -29,6 +29,13 @@ The repository includes a production-ready printed circuit board designed in **K
 
 > ⚠️ **V1 PCB Errata:** The 2-pin power connector near the USB-C port has its silkscreen polarity printed incorrectly. The actual pinout is **GND, VCC** (not VCC, GND as silkscreened). Wire accordingly to avoid damage.
 
+### Power & USB-C Assembly Notes*
+
+The board only draws 5V power from USB-C; no data lines are used. Two shortcuts make assembly easier:
+
+- **\*Skip the USB-C connector if you are new to soldering.** It is the only surface-mount part on the board; its pins are fine-pitch and tricky to solder by hand. Instead, cut an old USB cable, and solder its **VCC (red)** and **GND (black)** wires directly to the 2-pin power connector pads next to the USB-C footprint. Mind the polarity (see the V1 errata above).
+- **The 5.1kΩ resistors (R2, R3) are only needed for USB-C to USB-C.** They are the CC pull-downs that tell a USB-C power adapter or USB-C host to turn on 5V. If you power the board with a **USB-A to USB-C** cable (phone charger, computer port, power bank), 5V is always present on VBUS and R2/R3 can be left unpopulated. In that case only the **VBUS and GND** pins of the USB-C connector need to be soldered.
+
 ### Hardware Design Highlights:
 - **Form Factor:** 100mm x 100mm, 2-layer board (optimized for low-cost fabrication).
 - **MIDI Input:** Fully opto-isolated using a **6N138** optocoupler. The circuit is properly level-shifted to send safe 3.3V logic to the ESP32, while powering the optocoupler with 5V for fast, reliable data transmission.
@@ -36,6 +43,21 @@ The repository includes a production-ready printed circuit board designed in **K
 - **CV / Sync Out:** Capable of sending analog clock, reset, and play/stop signals to Eurorack/modular gear. Includes **BAT41** Schottky diodes for signal protection.
 - **CYD Integration:** Designed to interface cleanly with the Cheap Yellow Display (ESP32-2432S028R) ecosystem via standard 2.54mm pin headers.
 - **Power Delivery:** Robust decoupling with 100nF ceramics and 47µF (25V) electrolytics to keep clock and CV paths stable and noise-free.
+
+---
+
+## 🔊 Optional Metronome (Speaker)
+
+The firmware has a built-in metronome (1200 Hz click on beat 1, 800 Hz on beats 2-4) that plays through the CYD's onboard audio amplifier on GPIO 26. It is **disabled by default** because most builds have no speaker, and the METRONOME button is hidden from the TFT and the web UI.
+
+To use it:
+
+1. Wire the CYD speaker connector to the **SPEAKER IN** header on the BeatMesh board.
+2. Connect a small speaker (8 Ω, 0.5-1 W) to the **SPEAKER OUT** header on the BeatMesh board.
+3. In `src/main.cpp`, change `#define BEATMESH_METRONOME 0` to `1`.
+4. Recompile and flash (`pio run -t upload`, or upload the new `.bin` from the web portal). The metronome code is compiled out, so a rebuild is required; toggling it is not a runtime setting.
+
+The METRONOME button then appears on the main screen (row 2, left of PPQN) and on the web page.
 
 ---
 

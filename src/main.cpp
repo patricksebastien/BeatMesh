@@ -125,9 +125,14 @@ static const int cv_ppqn_options[] = { 1, 2, 4, 8, 24, 48 };
 static const int cv_ppqn_count = 6;
 static volatile int cv_ppqn_idx = 2; // index into cv_ppqn_options (default: 4 PPQN)
 
-// Metronome (LEDC PWM on GPIO 26 → onboard amp/speaker)
+// Metronome (LEDC PWM on GPIO 26 → CYD onboard amp → speaker header on the
+// BeatMesh board). Disabled by default: no speaker fitted on most builds.
+// Set to 1 and recompile to get the METRONOME button back (TFT + web UI).
+#define BEATMESH_METRONOME 0
+#if BEATMESH_METRONOME
 static volatile bool metronome_enabled = false;
 #define METRO_PIN GPIO_NUM_26
+#endif // BEATMESH_METRONOME
 
 // --- MIDI Monitor (small UI box, left of metronome button) ---
 static portMUX_TYPE g_mon_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -213,6 +218,7 @@ static void cv_out_init(void) {
     // gpio_set_level(CV_OUT_RUN_PIN, 0);
 }
 
+#if BEATMESH_METRONOME
 static void metronome_init(void) {
     ledc_timer_config_t timer_cfg = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -234,6 +240,7 @@ static void metronome_init(void) {
     };
     ledc_channel_config(&ch_cfg);
 }
+#endif // BEATMESH_METRONOME
 
 static void midi_init(void) {
     uart_config_t uart_cfg = {
@@ -1078,6 +1085,7 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
                 cv_ppqn = cv_ppqn_options[p];
             }
         }
+#if BEATMESH_METRONOME
         if (httpd_query_key_value(buf, "metro", val, sizeof(val)) == ESP_OK) {
             metronome_enabled = (atoi(val) != 0);
             if (!metronome_enabled) {
@@ -1085,6 +1093,7 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
                 ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
             }
         }
+#endif // BEATMESH_METRONOME
     }
     return captive_portal_redirect(req);
 }
@@ -1125,12 +1134,14 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "<a href='/set_mode?ppqn=%d' class='mbtn' style='background:#E64833;color:#FBE9D0;'>%s</a>",
         next_ppqn_idx, ppqn_labels[cur_ppqn_idx]);
 
+#if BEATMESH_METRONOME
     // Metronome toggle button
     char metro_btn[128];
     bool cur_metro = metronome_enabled;
     const char *metro_style = cur_metro ? "background:#6D9773;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
     snprintf(metro_btn, sizeof(metro_btn),
         "<a href='/set_mode?metro=%d' class='mbtn' style='%s'>%s</a>", cur_metro ? 0 : 1, metro_style, cur_metro ? "ON" : "OFF");
+#endif // BEATMESH_METRONOME
 
     // Connection status
     char conn_str[80];
@@ -1178,7 +1189,9 @@ static esp_err_t get_handler(httpd_req_t *req) {
                 "<hr style='border:0;border-top:1px solid #874F41;margin:12px 0'>"
                 "<div class='sel-row'>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>PPQN: </span>%s</div>"
+#if BEATMESH_METRONOME
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>METRONOME: </span>%s</div>"
+#endif // BEATMESH_METRONOME
                 "%s"
                 "<form action='/set_bpm' method='get'>"
                     "<div style='display:flex;gap:8px;align-items:center;margin:10px 0'>"
@@ -1222,7 +1235,10 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "</script>"
         "</body></html>",
         peers, conn_str,
-        mode_btns, ppqn_btns, metro_btn,
+        mode_btns, ppqn_btns,
+#if BEATMESH_METRONOME
+        metro_btn,
+#endif // BEATMESH_METRONOME
         midi_banner,
         bpm_minus, midi_is_master ? " off" : "", current_bpm, disabled, bpm_plus, midi_is_master ? " off" : "",
         disabled,
@@ -1468,8 +1484,10 @@ static void visual_task(void *param) {
     uint32_t last_btn_time = 0;
     int last_midi_mode = MODE_LINK;
     int last_cv_ppqn = 0;
+#if BEATMESH_METRONOME
     uint32_t metro_off_time = 0;
     bool last_metro_enabled = true; // force initial draw (metronome starts disabled)
+#endif // BEATMESH_METRONOME
     uint32_t last_mon_seq = 0xFFFFFFFFu; // MIDI monitor redraw tracker (force first draw)
     bool last_mon_led = false;
     int ui_screen = SCREEN_MAIN;        // active screen: main UI vs help
@@ -1496,19 +1514,23 @@ static void visual_task(void *param) {
         draw_main_chrome();
         last_beat = -1; last_bpm = -1; last_peers = 999;
         last_midi_mode = -1; last_cv_ppqn = -1;
+#if BEATMESH_METRONOME
         last_metro_enabled = !metronome_enabled;
+#endif // BEATMESH_METRONOME
         last_connection_state = !s_is_connected;
         last_portal_state = !s_portal_active;
         last_mon_seq = 0xFFFFFFFFu;
     };
 
     while (true) {
+#if BEATMESH_METRONOME
         // Metronome silence check
         if (metro_off_time && esp_log_timestamp() >= metro_off_time) {
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
             metro_off_time = 0;
         }
+#endif // BEATMESH_METRONOME
 
         int btn_state = gpio_get_level(BTN_BOOT);
         if (btn_state == 0 && last_btn_state == 1 && (esp_log_timestamp() - last_btn_time > 300)) {
@@ -1562,7 +1584,11 @@ static void visual_task(void *param) {
                     last_touch = esp_log_timestamp();
                 }
                 else if (ty >= 150 && ty < 178) {
-                    if (tx >= 84 && tx < 155) {
+                    if (false) {
+                        // (placeholder so the METRONOME branch below can be compiled out)
+                    }
+#if BEATMESH_METRONOME
+                    else if (tx >= 84 && tx < 155) {
                         // MET toggle button
                         metronome_enabled = !metronome_enabled;
                         if (!metronome_enabled) {
@@ -1570,7 +1596,9 @@ static void visual_task(void *param) {
                             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
                             metro_off_time = 0;
                         }
-                    } else if (tx >= ppqn_btn_x && tx < ppqn_btn_x + ppqn_btn_w) {
+                    }
+#endif // BEATMESH_METRONOME
+                    else if (tx >= ppqn_btn_x && tx < ppqn_btn_x + ppqn_btn_w) {
                         // PPQN cycle button (row 2): advance to next option
                         cv_ppqn_idx = (cv_ppqn_idx + 1) % cv_ppqn_count;
                         cv_ppqn = cv_ppqn_options[cv_ppqn_idx];
@@ -1642,6 +1670,7 @@ static void visual_task(void *param) {
                     tft->fillRoundRect(rect_x[i], 70, rect_w[i], 12, 3, color);
                 }
                 gpio_set_level(LED_RED, (cur_beat == 0) ? LED_ON : LED_OFF);
+#if BEATMESH_METRONOME
                 // Metronome click: bip (1200Hz) on beat 1, bop (800Hz) on 2-4
                 if (metronome_enabled) {
                     uint32_t freq = (cur_beat == 0) ? 1200 : 800;
@@ -1651,16 +1680,19 @@ static void visual_task(void *param) {
                     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
                     metro_off_time = esp_log_timestamp() + dur;
                 }
+#endif // BEATMESH_METRONOME
                 last_beat = cur_beat;
             }
         } else {
             if (last_beat != -2) {
                  for (int i=0; i<4; i++) tft->fillRoundRect(rect_x[i], 70, rect_w[i], 12, 3, C_VINTAGE_CREAM_DIM);
                  gpio_set_level(LED_RED, LED_OFF);
+#if BEATMESH_METRONOME
                  // Silence metronome on stop
                  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
                  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
                  metro_off_time = 0;
+#endif // BEATMESH_METRONOME
                  last_beat = -2;
             }
         }
@@ -1710,6 +1742,7 @@ static void visual_task(void *param) {
             last_cv_ppqn = cv_ppqn;
         }
 
+#if BEATMESH_METRONOME
         // METRONOME button redraw (left side of row 2)
         if (metronome_enabled != last_metro_enabled) {
             uint16_t bg = metronome_enabled ? C_VINTAGE_FERN : C_VINTAGE_BG_LT;
@@ -1722,6 +1755,7 @@ static void visual_task(void *param) {
             tft->setTextDatum(top_left);
             last_metro_enabled = metronome_enabled;
         }
+#endif // BEATMESH_METRONOME
 
         // MIDI monitor (left of metronome): activity LED + last message
         {
@@ -1865,7 +1899,9 @@ extern "C" void app_main(void) {
     midi_init();
     cv_clock_init();
     cv_out_init();
+#if BEATMESH_METRONOME
     metronome_init();
+#endif // BEATMESH_METRONOME
     xTaskCreatePinnedToCore(midi_clock_task, "midi_out", 4096, &g_link_state, 10, NULL, 1);
     xTaskCreatePinnedToCore(midi_in_task, "midi_in", 4096, &g_link_state, 10, NULL, 1);
 
