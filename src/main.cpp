@@ -442,14 +442,24 @@ static void midi_clock_task(void *param) {
         if (playing && !link_last_playing) {
             start_quantized = (midi_mode == MODE_LINK);
             if (start_quantized) {
+                // Link phase-encodes beat values per quantum: the quantum-1
+                // `beat` used for ticks and a quantum-4 beat can differ by a
+                // whole number of beats once a session has peers. Decide the
+                // bar in the quantum-4 frame, then shift back to tick frame.
+                double beat4 = abl_link_beat_at_time(midi_ss, now, START_QUANTUM);
+                double frame_off = (double)llround(beat - beat4);
                 uint64_t t_play = abl_link_time_for_is_playing(midi_ss);
                 double sb = abl_link_beat_at_time(midi_ss, t_play, START_QUANTUM);
                 double ph = sb - floor(sb / START_QUANTUM) * START_QUANTUM;
+                double bar4;
                 if (ph < START_SNAP_BEATS || ph > START_QUANTUM - START_SNAP_BEATS) {
-                    start_beat = round(sb / START_QUANTUM) * START_QUANTUM;
+                    bar4 = round(sb / START_QUANTUM) * START_QUANTUM;
                 } else {
-                    start_beat = ceil(beat / START_QUANTUM) * START_QUANTUM;
+                    bar4 = ceil(beat4 / START_QUANTUM) * START_QUANTUM;
                 }
+                start_beat = bar4 + frame_off;
+                // ESP_LOGI(TAG, "start armed: beat=%.2f bar=%.2f wait=%.2f beats (phase at play=%.2f)",
+                //          beat, start_beat, start_beat - beat, ph);
             } else {
                 start_beat = beat;
             }
@@ -462,6 +472,7 @@ static void midi_clock_task(void *param) {
 
         if (start_armed && (int)floor(beat * 24.0) >= start_tick - 1) {
             start_armed = false;  // gate open: fire Start/Reset this iteration
+            // if (start_quantized) ESP_LOGI(TAG, "start fired: beat=%.2f", beat);
         }
         // Transport as seen by the MIDI/CV outputs: playing and past the gate
         bool running = playing && !start_armed;
@@ -1213,6 +1224,26 @@ static void draw_main_chrome(void) {
     tft->setTextDatum(top_left);
 }
 
+// FORGET WIFI button (bottom-right of the last help page). Two-tap: first tap
+// arms it (red, "CONFIRM FORGET"), second tap within FORGET_ARM_MS wipes the
+// stored WiFi credentials and reboots into the setup portal.
+#define FORGET_ARM_MS 5000
+static void draw_forget_button(bool armed) {
+    tft->fillRoundRect(190, 208, 120, 24, 4, armed ? C_VINTAGE_RUST : C_VINTAGE_AMBER);
+    tft->setTextDatum(middle_center);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.2);
+    tft->drawString(armed ? "CONFIRM FORGET" : "FORGET WIFI", 190 + 120 / 2, 220);
+    tft->setTextDatum(top_left);
+}
+
+static void wifi_forget_and_restart(void) {
+    // Clears the STA config persisted in NVS by esp_wifi_set_config(); on
+    // reboot app_main sees an empty SSID and starts the setup portal.
+    esp_wifi_restore();
+    esp_restart();
+}
+
 // Draw one full-screen help page. NEXT is hidden on the last page.
 static void draw_help_page(int page) {
     tft->fillScreen(C_VINTAGE_BG);
@@ -1311,7 +1342,8 @@ static void draw_help_page(int page) {
         tft->drawString("workinprogress.ca", px, 168);
         tft->setTextColor(TFT_WHITE);
         tft->setTextDatum(bottom_right);
-        tft->drawString("version: " GIT_VERSION, 320 - px, 240 - 6);
+        tft->drawString("version: " GIT_VERSION, 320 - px, 204); // above the button row
+        draw_forget_button(false);
     }
 }
 
@@ -1334,6 +1366,8 @@ static void visual_task(void *param) {
     bool last_mon_led = false;
     int ui_screen = SCREEN_MAIN;        // active screen: main UI vs help
     int help_page = 0;                  // active help page index
+    bool forget_armed = false;          // FORGET WIFI first tap done
+    uint32_t forget_armed_at = 0;       // ms timestamp of that tap
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -1386,12 +1420,23 @@ static void visual_task(void *param) {
                 // BACK button (bottom-left) returns to the main UI
                 if (tx < 70 && ty >= 200) {
                     ui_screen = SCREEN_MAIN;
+                    forget_armed = false;
                     restore_main();
                 }
                 // NEXT button (bottom-right); absent on the last page
                 else if (help_page < HELP_PAGE_COUNT - 1 && tx >= 250 && ty >= 200) {
                     help_page++;
                     draw_help_page(help_page);
+                }
+                // FORGET WIFI button (last page only, bottom-right): two taps
+                else if (help_page == HELP_PAGE_COUNT - 1 && tx >= 180 && ty >= 200) {
+                    if (forget_armed) {
+                        wifi_forget_and_restart();
+                    } else {
+                        forget_armed = true;
+                        forget_armed_at = esp_log_timestamp();
+                        draw_forget_button(true);
+                    }
                 }
                 last_touch = esp_log_timestamp();
               } else {
@@ -1462,6 +1507,11 @@ static void visual_task(void *param) {
 
         // Help screen is modal: skip all main-UI rendering while it is shown.
         if (ui_screen != SCREEN_MAIN) {
+            // FORGET WIFI confirmation times out
+            if (forget_armed && esp_log_timestamp() - forget_armed_at > FORGET_ARM_MS) {
+                forget_armed = false;
+                draw_forget_button(false);
+            }
             vTaskDelay(pdMS_TO_TICKS(16));
             continue;
         }
