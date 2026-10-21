@@ -119,6 +119,12 @@ static link_state_t g_link_state;
 enum midi_mode_t { MODE_LINK = 0, MODE_MIDI_CLK = 1, MODE_MIDI_THRU = 2, MODE_CV = 3, MODE_COUNT = 4 };
 static volatile int midi_mode = MODE_LINK;
 
+// Transport as seen by the MIDI/CV outputs, published by midi_clock_task for
+// the UI: 0 = stopped, 1 = play pressed but Start not sent yet (waiting for
+// the bar), 2 = Start sent, running.
+enum play_state_t { PLAY_STOPPED = 0, PLAY_ARMED = 1, PLAY_RUNNING = 2 };
+static volatile int g_play_state = PLAY_STOPPED;
+
 // Shared PPQN setting for CV in/out — single button cycles through these
 static volatile int cv_ppqn = 4;
 static const int cv_ppqn_options[] = { 1, 2, 4, 8, 24, 48 };
@@ -492,6 +498,7 @@ static void midi_clock_task(void *param) {
         }
         // Transport as seen by the MIDI/CV outputs: playing and past the gate
         bool running = playing && !start_armed;
+        g_play_state = !playing ? PLAY_STOPPED : (start_armed ? PLAY_ARMED : PLAY_RUNNING);
 
         // ---- CV OUT: always active, independent of mode ----
 
@@ -1494,6 +1501,7 @@ static void visual_task(void *param) {
     int help_page = 0;                  // active help page index
     bool forget_armed = false;          // FORGET WIFI first tap done
     uint32_t forget_armed_at = 0;       // ms timestamp of that tap
+    int last_play_border = -1;          // PLAY button border: -1 unknown, 0 off, 1 on
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -1520,6 +1528,7 @@ static void visual_task(void *param) {
         last_connection_state = !s_is_connected;
         last_portal_state = !s_portal_active;
         last_mon_seq = 0xFFFFFFFFu;
+        last_play_border = -1;
     };
 
     while (true) {
@@ -1636,6 +1645,7 @@ static void visual_task(void *param) {
                     tft->drawRoundRect(90, 10, 70, 50, 5, C_VINTAGE_BG); 
                     tft->drawRoundRect(170, 10, 65, 50, 5, C_VINTAGE_BG); 
                     tft->drawRoundRect(245, 10, 65, 50, 5, C_VINTAGE_BG);
+                    last_play_border = -1; // feedback wiped the PLAY border, repaint below
                 }
               }
             }
@@ -1694,6 +1704,19 @@ static void visual_task(void *param) {
                  metro_off_time = 0;
 #endif // BEATMESH_METRONOME
                  last_beat = -2;
+            }
+        }
+
+        // PLAY button border: blinks (4 Hz) while Start waits for the bar,
+        // solid white once Start went out, off when stopped.
+        {
+            int ps = g_play_state;
+            int border = (ps == PLAY_RUNNING) ? 1
+                       : (ps == PLAY_ARMED)   ? (int)((esp_log_timestamp() / 125) & 1)
+                       : 0;
+            if (border != last_play_border) {
+                tft->drawRoundRect(90, 10, 70, 50, 5, border ? TFT_WHITE : C_VINTAGE_BG);
+                last_play_border = border;
             }
         }
 
