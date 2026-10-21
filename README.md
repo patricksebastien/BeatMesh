@@ -12,6 +12,7 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 - **Ableton Link:** Synchronize seamlessly over WiFi.
 - **OTA Firmware Updates:** Upload new firmware (`.bin`) directly from the web portal, no cable needed.
 - **Easy Soldering:** All through-hole components (except USB-C, see below*), beginner-friendly assembly.
+- **Easy to Print:** Two-piece 3D-printed case (top and bottom STL), no supports needed, held together with M3 screws.
 
 [![Schematic](board/schematic.png)](board/schematic.pdf)
 
@@ -20,6 +21,8 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 ![UI](UI.jpg)
 
 ![Web UI](UI_web.png)
+
+![3D printed case](3dprint.jpg)
 
 ---
 
@@ -45,6 +48,17 @@ The board only draws 5V power from USB-C; no data lines are used. Two shortcuts 
 - **CV / Sync Out:** Capable of sending analog clock, reset, and play/stop signals to Eurorack/modular gear. Includes **BAT41** Schottky diodes for signal protection.
 - **CYD Integration:** Designed to interface cleanly with the Cheap Yellow Display (ESP32-2432S028R) ecosystem via standard 2.54mm pin headers.
 - **Power Delivery:** Robust decoupling with 100nF ceramics and 47µF (25V) electrolytics to keep clock and CV paths stable and noise-free.
+
+---
+
+## 🖨️ 3D Printed Case
+
+The case is two pieces, in the `3dprint/` folder:
+
+- `3dprint/BeatMeshV2 - TOP.stl`
+- `3dprint/BeatMeshV2 - BOTTOM.stl`
+
+Both print flat on the bed with no supports. Any PLA or PETG works. Screw the CYD and the BeatMesh board directly together through the case with **M3 x 30 mm** screws.
 
 ---
 
