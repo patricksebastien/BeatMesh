@@ -14,6 +14,8 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 - **Easy Soldering:** All through-hole components (except USB-C, see below*), beginner-friendly assembly.
 - **Easy to Print:** Two-piece 3D-printed case (top and bottom STL), no supports needed, held together with M3 screws.
 
+![BeatMesh](BeatMesh.jpg)
+
 [![Schematic](board/schematic.png)](board/schematic.pdf)
 
 ![Board](board/board.png)
@@ -58,7 +60,12 @@ The case is two pieces, in the `3dprint/` folder:
 - `3dprint/BeatMeshV2 - TOP.stl`
 - `3dprint/BeatMeshV2 - BOTTOM.stl`
 
-Both print flat on the bed with no supports. Any PLA or PETG works. Screw the CYD and the BeatMesh board directly together through the case with **M3 x 30 mm** screws.
+Both print flat on the bed with no supports. Any PLA or PETG works.
+
+Hardware:
+
+- **4x M3 x 30 mm** screws: hold the top and bottom pieces together, screwing straight through both boards.
+- **4x M3 x 12 mm** screws with nuts: mount the CYD to the top piece.
 
 ---
 
