@@ -144,6 +144,13 @@ static uint8_t g_mon_data_needed = 0;
 #define MIDI_BAUD       31250
 #define MIDI_TICK_PERIOD 100  // Timer period in microseconds (10kHz polling)
 
+// --- Bar-quantized start (ported from tdlf_server) ---
+// In LINK mode, MIDI Start / CV Reset wait for the next bar boundary instead
+// of firing the instant the Link transport flips, so downstream gear lands on
+// beat 1 together with Link peers.
+#define START_QUANTUM     4.0   // beats per bar used for the start gate
+#define START_SNAP_BEATS  0.05  // Link start time this close to a bar: use that bar
+
 // --- CV Clock input (GPIO35, input-only pin) ---
 #define CV_CLK_PIN      GPIO_NUM_35
 
@@ -407,6 +414,13 @@ static void midi_clock_task(void *param) {
     bool cv_last_playing = last_playing;
     int cached_cv_ppqn = cv_ppqn;  // track ppqn changes to re-snap ticks
 
+    // Bar-quantized start state (see gate below)
+    bool link_last_playing = last_playing;
+    bool start_armed = false;        // Link says play, waiting for the bar
+    bool start_quantized = false;    // true when the pending start was bar-aligned
+    int start_tick = 0;              // 24 PPQN tick index of the pending start
+    double start_beat = 0.0;         // Link beat of the pending start
+
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
@@ -415,6 +429,42 @@ static void midi_clock_task(void *param) {
         bool playing = abl_link_is_playing(midi_ss);
         double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
         int64_t now_us = (int64_t)esp_timer_get_time();
+
+        // ---- Bar-quantized start gate ----
+        // Link transport flips immediately (peers quantize on their own side).
+        // MIDI Start and CV Reset wait for the next START_QUANTUM bar so
+        // downstream gear starts on beat 1 together with Link peers. If the
+        // Link start time already sits on a bar (peer with bar quantization,
+        // e.g. Live) that bar is used as-is. The gate opens one MIDI tick
+        // (1/24 beat) early so Start/Reset precede the first clock, as the
+        // MIDI spec asks. Stop stays immediate. Only in LINK mode: in the
+        // MIDI/CV-in modes the incoming Start already defines beat 1.
+        if (playing && !link_last_playing) {
+            start_quantized = (midi_mode == MODE_LINK);
+            if (start_quantized) {
+                uint64_t t_play = abl_link_time_for_is_playing(midi_ss);
+                double sb = abl_link_beat_at_time(midi_ss, t_play, START_QUANTUM);
+                double ph = sb - floor(sb / START_QUANTUM) * START_QUANTUM;
+                if (ph < START_SNAP_BEATS || ph > START_QUANTUM - START_SNAP_BEATS) {
+                    start_beat = round(sb / START_QUANTUM) * START_QUANTUM;
+                } else {
+                    start_beat = ceil(beat / START_QUANTUM) * START_QUANTUM;
+                }
+            } else {
+                start_beat = beat;
+            }
+            start_tick = (int)floor(start_beat * 24.0 + 0.5);
+            start_armed = true;
+        } else if (!playing) {
+            start_armed = false;  // stopped before the bar: never started
+        }
+        link_last_playing = playing;
+
+        if (start_armed && (int)floor(beat * 24.0) >= start_tick - 1) {
+            start_armed = false;  // gate open: fire Start/Reset this iteration
+        }
+        // Transport as seen by the MIDI/CV outputs: playing and past the gate
+        bool running = playing && !start_armed;
 
         // ---- CV OUT: always active, independent of mode ----
 
@@ -436,20 +486,24 @@ static void midi_clock_task(void *param) {
         }
 
         // Start/stop: reset trigger on start (run gate disabled)
-        if (playing && !cv_last_playing) {
+        if (running && !cv_last_playing) {
             // gpio_set_level(CV_OUT_RUN_PIN, 1);
             gpio_set_level(CV_OUT_RESET_PIN, 1);
             cv_reset_pulse_end = now_us + CV_PULSE_WIDTH_US;
-            last_cv_ticks = (int)floor(beat * (double)cur_ppqn);
-        } else if (!playing && cv_last_playing) {
+            // Quantized: first clock pulse lands exactly on start_beat, one
+            // MIDI tick after Reset. Otherwise next tick boundary as before.
+            last_cv_ticks = start_quantized
+                ? (int)floor(start_beat * (double)cur_ppqn + 0.5) - 1
+                : (int)floor(beat * (double)cur_ppqn);
+        } else if (!running && cv_last_playing) {
             // gpio_set_level(CV_OUT_RUN_PIN, 0);
             gpio_set_level(CV_OUT_CLK_PIN, 0);
             cv_clk_pulse_end = 0;
         }
-        cv_last_playing = playing;
+        cv_last_playing = running;
 
         // Clock tick pulses (uses shared cv_ppqn setting)
-        if (playing) {
+        if (running) {
             int ticks = (int)floor(beat * (double)cur_ppqn);
             if (ticks > last_cv_ticks) {
                 gpio_set_level(CV_OUT_CLK_PIN, 1);
@@ -468,21 +522,25 @@ static void midi_clock_task(void *param) {
 
         // Re-sync after returning from MIDI-in mode
         if (!midi_was_active) {
-            last_playing = playing;
+            last_playing = running;
             last_midi_ticks = (int)floor(beat * 24.0);
             midi_was_active = true;
             continue;
         }
 
         // Start/stop transitions
-        if (playing && !last_playing) {
+        if (running && !last_playing) {
             midi_send_start();
-        } else if (!playing && last_playing) {
+            // Quantized: first 0xF8 lands exactly on start_beat, one tick
+            // after 0xFA. Otherwise next tick boundary.
+            last_midi_ticks = start_quantized ? start_tick - 1
+                                              : (int)floor(beat * 24.0);
+        } else if (!running && last_playing) {
             midi_send_stop();
         }
-        last_playing = playing;
+        last_playing = running;
 
-        if (playing) {
+        if (running) {
             int ticks = (int)floor(beat * 24.0);
             if (ticks > last_midi_ticks) {
                 midi_send_tick();
