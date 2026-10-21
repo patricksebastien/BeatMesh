@@ -86,7 +86,7 @@ The METRONOME button then appears on the main screen (row 2, left of PPQN) and o
 
 ## 💻 Installation & Dependencies
 
-> Built with ESP-IDF v5.5.0
+> Built with PlatformIO platform `espressif32@6.12.0`, framework `espidf` (ESP-IDF v5.5.0).
 
 External components live under `components/` as git submodules pinned to the versions used in this project:
 
@@ -125,32 +125,41 @@ git -C components/asio/asio apply ../../../patches/asio-esp32-rethrow-fix.patch
 ## ⚙️ Configuration Files
 
 ### 1. `platformio.ini`
-Add the following to your environment configuration to ensure correct serial speeds, flash sizing, and ASIO compatibility:
+Add the following to your environment configuration to ensure correct serial speeds, flash sizing, the OTA partition table, and ASIO compatibility:
 
 ```ini
+[env:esp32dev]
+platform = espressif32@6.12.0
+board = esp32dev
+framework = espidf
 monitor_speed = 115200
 board_upload.flash_size = 4MB
-board_build.partitions = huge_app.csv
+board_build.partitions = ota_4mb.csv    ; two ~1.94MB OTA slots (web firmware update)
 
-build_flags = 
+extra_scripts = pre:git_version.py      ; injects GIT_VERSION (short commit hash) into the build
+
+build_flags =
     -fexceptions
     -D ASIO_STANDALONE
     -D ASIO_NO_TYPEID
 ```
 
-### 2. `huge_app.csv` (Partition Table)
-Create this file in the root directory. Link and LovyanGFX make the binary quite large, so the default partition table is too small.
+### 2. `ota_4mb.csv` (Partition Table)
+Create this file in the root directory. Link and LovyanGFX make the binary quite large, so the default partition table is too small. Two ~1.94 MB app slots give room for the OTA web update while still fitting the ~1.4 MB image.
 
 ```csv
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     ,        0x4000,
-otadata,  data, ota,     ,        0x2000,
-phy_init, data, phy,     ,        0x1000,
-factory,  app,  factory, ,        0x300000,
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x1F0000,
+ota_1,    app,  ota_1,   0x200000, 0x1F0000,
 ```
 
+Changing the partition table requires one flash over USB; OTA works from then on.
+
 ### 3. `sdkconfig.defaults`
-Create this file in the root directory. These settings configure flash size/speed, enable C++ exceptions (required for ASIO/Link), and set the partition table layout.
+Create this file in the root directory. The essential settings are below; the full file in the repo also tunes WiFi buffers, LWIP, UDP mailboxes and TCP timeouts for up to 10 Link peers plus the web portal.
 
 ```ini
 # Flash Size & Speed (CYD has a 4MB Flash chip)
@@ -162,18 +171,24 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 CONFIG_COMPILER_CXX_RTTI=y
 
-# Partition Table Layout
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# Partition Table Layout (OTA, see ota_4mb.csv above)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="ota_4mb.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # CPU Frequency (Ensure Link timing on Core 1 and Display/WiFi on Core 0 run smoothly)
-CONFIG_ESP_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Link tasks on Core 1 (WiFi stays on Core 0)
+CONFIG_LINK_ESP_TASK_CORE_ID=1
 
 # LWIP (Networking for Link - Multicast support is crucial)
-CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_MAX_SOCKETS=32
 CONFIG_LWIP_IGMP=y
+CONFIG_LWIP_SO_REUSE=y
 
-# Common NVS/WiFi Settings
-CONFIG_ESP_WIFI_AUTH_PHASE2_ENABLED=y
+# Disable Bluetooth (WiFi only)
 CONFIG_BT_ENABLED=n
 ```
 
@@ -183,5 +198,5 @@ Include the necessary libraries via `REQUIRES` so ESP-IDF links them properly:
 ```cmake
 idf_component_register(SRCS "main.cpp"
                     INCLUDE_DIRS "."
-                    REQUIRES LovyanGFX esp_http_server nvs_flash esp_wifi esp_event esp_abl_link)
+                    REQUIRES LovyanGFX esp_http_server nvs_flash esp_wifi esp_event esp_abl_link app_update)
 ```
