@@ -1838,8 +1838,18 @@ static void visual_task(void *param) {
             } else if (s_is_connected) {
                 tft->fillRect(0, 215, 320, 25, C_VINTAGE_CREAM);
                 tft->setTextColor(C_VINTAGE_BG); tft->setTextSize(2);
+                // "<ssid> <ip>", 26 chars max at text size 2 (12 px/char on 320 px).
+                // IP always shown whole; SSID truncated with '~' if needed.
                 char status_msg[80];
-                snprintf(status_msg, sizeof(status_msg), "LINK: %s (%s)", s_ssid_name, s_ip_str);
+                const int max_chars = 26;
+                int ip_len = strlen(s_ip_str);
+                int ssid_room = max_chars - ip_len - 1;
+                int ssid_len = strlen(s_ssid_name);
+                if (ssid_len <= ssid_room) {
+                    snprintf(status_msg, sizeof(status_msg), "%s %s", s_ssid_name, s_ip_str);
+                } else {
+                    snprintf(status_msg, sizeof(status_msg), "%.*s~ %s", ssid_room - 1, s_ssid_name, s_ip_str);
+                }
                 tft->drawCenterString(status_msg, 160, 220);
             } else if (s_portal_active) {
                 tft->fillRect(0, 215, 320, 25, C_VINTAGE_CREAM);
