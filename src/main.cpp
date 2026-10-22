@@ -20,6 +20,7 @@
 #include "esp_private/esp_clk.h"
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "mdns.h"
 
 // --- LovyanGFX Configuration (CYD) ---
@@ -122,9 +123,56 @@ static volatile int midi_mode = MODE_LINK;
 // IGNORE STOP: when set, stop requests coming from outside (Link peers, MIDI
 // in 0xFC, CV clock timeout) are refused and the transport is re-asserted as
 // playing. Only BeatMesh's own controls (TFT STOP, BOOT button, web STOP) can
-// stop; they set g_local_stop right before committing the stop.
+// stop: they bypass the check by setting g_local_stop right before committing
+// the stop. The checkbox itself stays as the user left it.
 static volatile bool g_ignore_stop = false;
 static volatile bool g_local_stop = false;
+static volatile int64_t g_local_stop_us = 0;   // when g_local_stop was set (esp_timer)
+#define LOCAL_STOP_WINDOW_US 2000000           // local stop flag valid for 2 s
+
+// MIDI METRONOME: short note on every beat on the MIDI outputs. Downbeat
+// note 72, beats 2-4 note 64. Settings page checkbox + web toggle.
+static volatile bool g_midi_metro = false;
+static volatile int  g_midi_metro_ch = 0;   // 0-based: 0 = channel 1, 9 = channel 10
+#define MIDI_METRO_NOTE_DOWN  72      // beat 1
+#define MIDI_METRO_NOTE_BEAT  64      // beats 2-4
+#define MIDI_METRO_VEL        100
+#define MIDI_METRO_GATE_US    40000   // 40 ms note length
+
+// RANDOM MIDI (fun). NOTES: on every beat one random pentatonic note, random
+// length, on a random channel 1..RANDOM_MIDI_NUM_CH. CC: RANDOM_MIDI_NUM_CC
+// random-walk controllers (random CC number + channel picked each time the box
+// is turned on), each nudged by a random step every beat. Zero cost when off:
+// one bool test per beat. Settings page checkboxes + web toggles.
+static volatile bool g_rand_notes = false;
+static volatile bool g_rand_cc = false;
+// DRUMS: fixed four-on-the-floor on GM drum channel 10 (0-based 9):
+// kick every beat, snare on 2 and 4, closed hat on every beat, open hat on
+// every off-beat 8th. Short gate.
+static volatile bool g_rand_drums = false;
+#define DRUMS_CHANNEL     9
+#define DRUM_KICK         36
+#define DRUM_SNARE        38
+#define DRUM_CLOSED_HAT   42
+#define DRUM_OPEN_HAT     46
+#define DRUM_GATE_US      30000
+// CC pool for the walkers: sound-shaping CCs that most synths implement plus
+// the Elektron Model:Cycles track parameters (manual Appendix A.1), so one
+// checkbox works on both.
+//   Generic: 1 mod wheel, 71 resonance, 74 cutoff, 72 release, 73 attack,
+//            75 decay, 91 reverb, 93 chorus, 10 pan
+//   Model:Cycles: 16 Color, 17 Shape, 18 Sweep, 19 Contour, 80 Decay,
+//            12 Delay send, 13 Reverb send (10 Pan shared)
+// Left out on purpose: volume 7, pitch 65, mute 94, level 95, pedals 64-69,
+// bank/data entry 0/6/32/38/96-101, channel mode 120-127.
+static const uint8_t k_rand_cc_pool[] = { 1, 71, 74, 72, 73, 75, 91, 93, 10,
+                                          16, 17, 18, 19, 80, 12, 13 };
+#define RAND_CC_POOL_SIZE (sizeof(k_rand_cc_pool) / sizeof(k_rand_cc_pool[0]))
+#define RANDOM_MIDI_NUM_CH   6    // channels 1..6
+#define RANDOM_MIDI_MAX_VOICES 4  // notes per beat: 1 (40%), 2 (30%), 3 (20%), 4 (10%)
+#define RANDOM_MIDI_NUM_CC   6    // simultaneous CC walkers, one per channel 1..6
+#define RANDOM_MIDI_CC_STEP  12   // max |step| per beat
+
 
 // Transport as seen by the MIDI/CV outputs, published by midi_clock_task for
 // the UI: 0 = stopped, 1 = play pressed but Start not sent yet (waiting for
@@ -292,6 +340,21 @@ static void midi_send_continue(void) {
     uart_write_bytes(MIDI_UART, (const char *)&b, 1);
 }
 
+static void midi_send_note_on(uint8_t ch, uint8_t note, uint8_t vel) {
+    const uint8_t b[3] = { (uint8_t)(0x90 | (ch & 0x0F)), (uint8_t)(note & 0x7F), (uint8_t)(vel & 0x7F) };
+    uart_write_bytes(MIDI_UART, (const char *)b, 3);
+}
+
+static void midi_send_note_off(uint8_t ch, uint8_t note) {
+    const uint8_t b[3] = { (uint8_t)(0x80 | (ch & 0x0F)), (uint8_t)(note & 0x7F), 0 };
+    uart_write_bytes(MIDI_UART, (const char *)b, 3);
+}
+
+static void midi_send_cc(uint8_t ch, uint8_t cc, uint8_t val) {
+    const uint8_t b[3] = { (uint8_t)(0xB0 | (ch & 0x0F)), (uint8_t)(cc & 0x7F), (uint8_t)(val & 0x7F) };
+    uart_write_bytes(MIDI_UART, (const char *)b, 3);
+}
+
 static void midi_mon_publish(const char *l1, const char *l2) {
     portENTER_CRITICAL(&g_mon_mux);
     strncpy(g_midi_mon_l1, l1, sizeof(g_midi_mon_l1));
@@ -443,6 +506,38 @@ static void midi_clock_task(void *param) {
     bool cv_last_playing = last_playing;
     int cached_cv_ppqn = cv_ppqn;  // track ppqn changes to re-snap ticks
 
+    // MIDI metronome: note currently sounding (-1 none) and its note-off time
+    int metro_note = -1;
+    int metro_note_ch = 0;
+    int64_t metro_off_us = 0;
+
+    // Random MIDI: per-channel note currently sounding (-1 none) and its
+    // note-off time; CC walkers (picked when the box turns on)
+    int rnd_note[RANDOM_MIDI_NUM_CH];
+    int64_t rnd_note_off_us[RANDOM_MIDI_NUM_CH];
+    for (int i = 0; i < RANDOM_MIDI_NUM_CH; i++) { rnd_note[i] = -1; rnd_note_off_us[i] = 0; }
+    // Drums: notes of the last step still sounding (all share one note-off time)
+    uint8_t drum_notes[4];
+    int drum_count = 0;
+    int64_t drum_off_us = 0;
+    auto drums_off = [&]() {
+        for (int i = 0; i < drum_count; i++) midi_send_note_off(DRUMS_CHANNEL, drum_notes[i]);
+        drum_count = 0;
+    };
+    bool rnd_cc_active = false;
+    uint8_t rnd_cc_num[RANDOM_MIDI_NUM_CC], rnd_cc_ch[RANDOM_MIDI_NUM_CC], rnd_cc_val[RANDOM_MIDI_NUM_CC];
+    auto rnd_all_notes_off = [&]() {
+        for (int i = 0; i < RANDOM_MIDI_NUM_CH; i++) {
+            if (rnd_note[i] >= 0) { midi_send_note_off(i, rnd_note[i]); rnd_note[i] = -1; }
+        }
+    };
+
+    // IGNORE STOP bookkeeping: raw Link transport last seen, and whether we
+    // are currently refusing an external stop (waiting for our re-assert).
+    bool last_link_playing = last_playing;
+    bool refusing = false;
+    int64_t last_reassert_us = 0;
+
     // Bar-quantized start state (see gate below)
     bool link_last_playing = last_playing;
     bool start_armed = false;        // Link says play, waiting for the bar
@@ -455,17 +550,41 @@ static void midi_clock_task(void *param) {
 
         abl_link_capture_audio_session_state(s->link, midi_ss);
         now = abl_link_clock_micros(s->link);
-        bool playing = abl_link_is_playing(midi_ss);
-        // IGNORE STOP: a stop that did not come from BeatMesh's own controls is
-        // refused. Re-assert play on the session so Link peers follow again.
-        if (!playing && g_ignore_stop && !g_local_stop) {
-            abl_link_set_is_playing(midi_ss, true, now);
-            abl_link_commit_audio_session_state(s->link, midi_ss);
-            playing = true;
-        }
-        if (playing) g_local_stop = false;  // local stop consumed (or play resumed)
-        double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
         int64_t now_us = (int64_t)esp_timer_get_time();
+        bool link_playing = abl_link_is_playing(midi_ss);
+        bool playing = link_playing;
+
+        // IGNORE STOP: only a play->stop edge that did not come from BeatMesh's
+        // own controls (TFT STOP, BOOT, web STOP set g_local_stop just before
+        // committing) is refused: play is re-asserted on the Link session so
+        // peers follow again, and the outputs never see the stop. The checkbox
+        // itself is untouched. A local stop always goes through.
+        if (!link_playing) {
+            if (refusing) {
+                playing = true;  // our re-assert has not landed yet (or a peer stopped again)
+                if (now_us - last_reassert_us > 200000) {
+                    abl_link_set_is_playing(midi_ss, true, now);
+                    abl_link_commit_audio_session_state(s->link, midi_ss);
+                    last_reassert_us = now_us;
+                }
+            } else if (last_link_playing) {
+                // stop edge
+                bool local = g_local_stop && (now_us - g_local_stop_us) < LOCAL_STOP_WINDOW_US;
+                if (g_ignore_stop && !local) {
+                    abl_link_set_is_playing(midi_ss, true, now);
+                    abl_link_commit_audio_session_state(s->link, midi_ss);
+                    last_reassert_us = now_us;
+                    refusing = true;
+                    playing = true;
+                }
+                g_local_stop = false;  // consumed either way
+            }
+        } else {
+            refusing = false;
+        }
+        last_link_playing = link_playing;
+
+        double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
 
         // ---- Bar-quantized start gate ----
         // Link transport flips immediately (peers quantize on their own side).
@@ -565,9 +684,28 @@ static void midi_clock_task(void *param) {
         bool midi_active = (midi_mode == MODE_LINK || midi_mode == MODE_CV);
 
         if (!midi_active) {
+            if (metro_note >= 0) {  // do not leave a metronome note hanging
+                midi_send_note_off(metro_note_ch, metro_note);
+                metro_note = -1;
+            }
+            rnd_all_notes_off();
+            drums_off();
             midi_was_active = false;
             continue;
         }
+
+        // MIDI metronome / random note: end the note after its gate
+        if (metro_note >= 0 && now_us >= metro_off_us) {
+            midi_send_note_off(metro_note_ch, metro_note);
+            metro_note = -1;
+        }
+        for (int i = 0; i < RANDOM_MIDI_NUM_CH; i++) {
+            if (rnd_note[i] >= 0 && now_us >= rnd_note_off_us[i]) {
+                midi_send_note_off(i, rnd_note[i]);
+                rnd_note[i] = -1;
+            }
+        }
+        if (drum_count > 0 && now_us >= drum_off_us) drums_off();
 
         // Re-sync after returning from MIDI-in mode
         if (!midi_was_active) {
@@ -586,6 +724,12 @@ static void midi_clock_task(void *param) {
                                               : (int)floor(beat * 24.0);
         } else if (!running && last_playing) {
             midi_send_stop();
+            if (metro_note >= 0) {
+                midi_send_note_off(metro_note_ch, metro_note);
+                metro_note = -1;
+            }
+            rnd_all_notes_off();
+            drums_off();
         }
         last_playing = running;
 
@@ -593,6 +737,95 @@ static void midi_clock_task(void *param) {
             int ticks = (int)floor(beat * 24.0);
             if (ticks > last_midi_ticks) {
                 midi_send_tick();
+                // MIDI metronome: on every beat (24 ticks), 72 on the
+                // downbeat of the 4-beat bar, 64 on beats 2-4.
+                if (g_midi_metro && (ticks % 24) == 0) {
+                    int bar_beat = (int)floor(abl_link_phase_at_time(midi_ss, now, 4.0) + 0.05) % 4;
+                    uint8_t note = (bar_beat == 0) ? MIDI_METRO_NOTE_DOWN : MIDI_METRO_NOTE_BEAT;
+                    if (metro_note >= 0) midi_send_note_off(metro_note_ch, metro_note);
+                    metro_note_ch = g_midi_metro_ch;
+                    midi_send_note_on(metro_note_ch, note, MIDI_METRO_VEL);
+                    metro_note = note;
+                    metro_off_us = now_us + MIDI_METRO_GATE_US;
+                }
+                // DRUMS, on the 8th-note grid (12 ticks). Step within the bar
+                // from the quantum-4 phase; +0.05 beat guards the float edge.
+                if (g_rand_drums && (ticks % 12) == 0) {
+                    int step8 = (int)floor(abl_link_phase_at_time(midi_ss, now, 4.0) * 2.0 + 0.1) % 8;
+                    drums_off();  // previous step, if still sounding
+                    if ((step8 & 1) == 0) {
+                        // on the beat: kick + closed hat, snare on beats 2 and 4
+                        midi_send_note_on(DRUMS_CHANNEL, DRUM_KICK, 110);       drum_notes[drum_count++] = DRUM_KICK;
+                        midi_send_note_on(DRUMS_CHANNEL, DRUM_CLOSED_HAT, 80);  drum_notes[drum_count++] = DRUM_CLOSED_HAT;
+                        if (step8 == 2 || step8 == 6) {
+                            midi_send_note_on(DRUMS_CHANNEL, DRUM_SNARE, 100);  drum_notes[drum_count++] = DRUM_SNARE;
+                        }
+                    } else {
+                        // off-beat: open hat
+                        midi_send_note_on(DRUMS_CHANNEL, DRUM_OPEN_HAT, 90);    drum_notes[drum_count++] = DRUM_OPEN_HAT;
+                    }
+                    drum_off_us = now_us + DRUM_GATE_US;
+                }
+
+                // Random MIDI. NOTES on every 8th note (12 ticks): C major
+                // pentatonic (C3..A5), length 1/8 .. 1 beat, on random distinct
+                // channels 1..6, one voice per channel. CC once per beat: each
+                // walker nudged by -12..+12.
+                if (!g_rand_cc) rnd_cc_active = false;  // next enable picks a new CC set
+                if ((g_rand_notes && (ticks % 12) == 0) || (g_rand_cc && (ticks % 24) == 0)) {
+                    if (g_rand_notes && (ticks % 12) == 0) {
+                        static const uint8_t penta[5] = { 0, 2, 4, 7, 9 };
+                        int64_t beat_us = (int64_t)(60000000.0 / abl_link_tempo(midi_ss));
+                        // How many notes this step: weighted 1/2/3/4, never more
+                        uint32_t r = esp_random();
+                        int roll = r % 10;
+                        int n = (roll < 4) ? 1 : (roll < 7) ? 2 : (roll < 9) ? 3 : 4;
+                        if (n > RANDOM_MIDI_MAX_VOICES) n = RANDOM_MIDI_MAX_VOICES;
+                        // n distinct channels: partial Fisher-Yates over 0..NUM_CH-1
+                        uint8_t chs[RANDOM_MIDI_NUM_CH];
+                        for (int i = 0; i < RANDOM_MIDI_NUM_CH; i++) chs[i] = (uint8_t)i;
+                        for (int k = 0; k < n; k++) {
+                            int j = k + (int)((r >> (8 + 4 * k)) % (RANDOM_MIDI_NUM_CH - k));
+                            uint8_t t = chs[k]; chs[k] = chs[j]; chs[j] = t;
+                        }
+                        for (int k = 0; k < n; k++) {
+                            int ch = chs[k];
+                            uint32_t rn = esp_random();
+                            uint8_t note = 48 + ((rn >> 8) % 3) * 12 + penta[rn % 5];
+                            uint8_t vel = 70 + ((rn >> 16) % 50);
+                            if (rnd_note[ch] >= 0) midi_send_note_off(ch, rnd_note[ch]);
+                            midi_send_note_on(ch, note, vel);
+                            rnd_note[ch] = note;
+                            rnd_note_off_us[ch] = now_us + beat_us * (1 + ((rn >> 24) % 8)) / 8;
+                        }
+                    }
+                    if (g_rand_cc && (ticks % 24) == 0) {
+                        if (!rnd_cc_active) {
+                            // Just turned on: pick fresh (channel, CC) pairs from the
+                            // pool, channels distinct so each walker hits its own track.
+                            uint8_t chs[RANDOM_MIDI_NUM_CH];
+                            for (int i = 0; i < RANDOM_MIDI_NUM_CH; i++) chs[i] = (uint8_t)i;
+                            for (int i = 0; i < RANDOM_MIDI_NUM_CC && i < RANDOM_MIDI_NUM_CH; i++) {
+                                int j = i + (int)(esp_random() % (RANDOM_MIDI_NUM_CH - i));
+                                uint8_t t = chs[i]; chs[i] = chs[j]; chs[j] = t;
+                            }
+                            for (int i = 0; i < RANDOM_MIDI_NUM_CC; i++) {
+                                uint32_t r = esp_random();
+                                rnd_cc_num[i] = k_rand_cc_pool[r % RAND_CC_POOL_SIZE];
+                                rnd_cc_ch[i] = chs[i % RANDOM_MIDI_NUM_CH];
+                                rnd_cc_val[i] = 64;
+                            }
+                            rnd_cc_active = true;
+                        }
+                        for (int i = 0; i < RANDOM_MIDI_NUM_CC; i++) {
+                            uint32_t r = esp_random();
+                            int v = (int)rnd_cc_val[i] + (int)(r % (2 * RANDOM_MIDI_CC_STEP + 1)) - RANDOM_MIDI_CC_STEP;
+                            if (v < 0) v = 0; else if (v > 127) v = 127;
+                            rnd_cc_val[i] = (uint8_t)v;
+                            midi_send_cc(rnd_cc_ch[i], rnd_cc_num[i], rnd_cc_val[i]);
+                        }
+                    }
+                }
             }
             last_midi_ticks = ticks;
         }
@@ -985,7 +1218,7 @@ static esp_err_t set_transport_handler(httpd_req_t *req) {
             bool is_playing = (strcmp(state_val, "play") == 0);
             abl_link_capture_app_session_state(g_link_state.link, g_web_ss);
             uint64_t now = abl_link_clock_micros(g_link_state.link);
-            if (!is_playing) g_local_stop = true;  // BeatMesh's own control: stop allowed
+            if (!is_playing) { g_local_stop_us = esp_timer_get_time(); g_local_stop = true; }  // own control: bypasses IGNORE STOP
             abl_link_set_is_playing(g_web_ss, is_playing, now);
             abl_link_commit_app_session_state(g_link_state.link, g_web_ss);
         }
@@ -1108,6 +1341,21 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
         if (httpd_query_key_value(buf, "ignstop", val, sizeof(val)) == ESP_OK) {
             g_ignore_stop = (atoi(val) != 0);
         }
+        if (httpd_query_key_value(buf, "mmetro", val, sizeof(val)) == ESP_OK) {
+            g_midi_metro = (atoi(val) != 0);
+        }
+        if (httpd_query_key_value(buf, "rdrums", val, sizeof(val)) == ESP_OK) {
+            g_rand_drums = (atoi(val) != 0);
+        }
+        if (httpd_query_key_value(buf, "rnotes", val, sizeof(val)) == ESP_OK) {
+            g_rand_notes = (atoi(val) != 0);
+        }
+        if (httpd_query_key_value(buf, "rcc", val, sizeof(val)) == ESP_OK) {
+            g_rand_cc = (atoi(val) != 0);
+        }
+        if (httpd_query_key_value(buf, "mmetroch", val, sizeof(val)) == ESP_OK) {
+            g_midi_metro_ch = (atoi(val) == 10) ? 9 : 0;  // channel 1 or 10 only
+        }
         if (httpd_query_key_value(buf, "ppqn", val, sizeof(val)) == ESP_OK) {
             int p = atoi(val);
             if (p >= 0 && p < cv_ppqn_count) {
@@ -1171,6 +1419,29 @@ static esp_err_t get_handler(httpd_req_t *req) {
     snprintf(ignstop_btn, sizeof(ignstop_btn),
         "<a href='/set_mode?ignstop=%d' class='mbtn' style='%s'>%s</a>", cur_ignstop ? 0 : 1, ignstop_style, cur_ignstop ? "ON" : "OFF");
 
+    // MIDI metronome toggle button
+    char mmetro_btn[256];
+    bool cur_mmetro = g_midi_metro;
+    const char *mmetro_style = cur_mmetro ? "background:#6D9773;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+    int cur_mmetro_ch = (g_midi_metro_ch == 9) ? 10 : 1;
+    snprintf(mmetro_btn, sizeof(mmetro_btn),
+        "<a href='/set_mode?mmetro=%d' class='mbtn' style='%s'>%s</a>"
+        "<a href='/set_mode?mmetroch=%d' class='mbtn' style='background:#E64833;color:#FBE9D0;'>CH %d</a>",
+        cur_mmetro ? 0 : 1, mmetro_style, cur_mmetro ? "ON" : "OFF",
+        cur_mmetro_ch == 1 ? 10 : 1, cur_mmetro_ch);
+
+    // Random MIDI toggle buttons (notes, cc)
+    char rand_btns[384];
+    const char *on_style  = "background:#6D9773;color:#FBE9D0;";
+    const char *off_style = "background:#1e3b46;color:#90AEAD;";
+    snprintf(rand_btns, sizeof(rand_btns),
+        "<a href='/set_mode?rdrums=%d' class='mbtn' style='%s'>DRUMS</a>"
+        "<a href='/set_mode?rnotes=%d' class='mbtn' style='%s'>NOTES</a>"
+        "<a href='/set_mode?rcc=%d' class='mbtn' style='%s'>CC</a>",
+        g_rand_drums ? 0 : 1, g_rand_drums ? on_style : off_style,
+        g_rand_notes ? 0 : 1, g_rand_notes ? on_style : off_style,
+        g_rand_cc ? 0 : 1, g_rand_cc ? on_style : off_style);
+
 #if BEATMESH_METRONOME
     // Metronome toggle button
     char metro_btn[128];
@@ -1227,6 +1498,8 @@ static esp_err_t get_handler(httpd_req_t *req) {
                 "<div class='sel-row'>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>PPQN: </span>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>IGNORE STOP: </span>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>MIDI METRONOME: </span>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>RANDOM MIDI: </span>%s</div>"
 #if BEATMESH_METRONOME
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>METRONOME: </span>%s</div>"
 #endif // BEATMESH_METRONOME
@@ -1273,7 +1546,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "</script>"
         "</body></html>",
         peers, conn_str,
-        mode_btns, ppqn_btns, ignstop_btn,
+        mode_btns, ppqn_btns, ignstop_btn, mmetro_btn, rand_btns,
 #if BEATMESH_METRONOME
         metro_btn,
 #endif // BEATMESH_METRONOME
@@ -1359,26 +1632,26 @@ void start_setup_portal() {
 
 // --- Help screens ---
 #define HELP_PAGE_COUNT 4
-enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1 };
+enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1, SCREEN_SETTINGS = 2 };
 
 // GIT_VERSION define moved to the top globals (also used by the web UI firmware card)
 //#ifndef GIT_VERSION
 //#define GIT_VERSION "unknown"
 //#endif
 
-// IGNORE STOP checkbox (row 2, left of PPQN; same slot as the optional
-// METRONOME button, which takes precedence when BEATMESH_METRONOME is 1).
-static void draw_ignore_stop_button(bool on) {
-    tft->fillRoundRect(84, 150, 71, 28, 4, on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
-    tft->drawRect(90, 157, 14, 14, C_VINTAGE_CREAM);          // checkbox frame
-    if (on) tft->fillRect(93, 160, 8, 8, C_VINTAGE_CREAM);    // checkmark
-    tft->setTextSize(1);
-    tft->setTextColor(C_VINTAGE_CREAM);
-    tft->setTextDatum(middle_left);
-    tft->drawString("IGNORE", 109, 159);
-    tft->drawString("STOP", 109, 169);
-    tft->setTextDatum(top_left);
-}
+// IGNORE STOP checkbox on the main page (row 2, left of PPQN). Moved to the
+// SETTINGS page; kept here commented out.
+// static void draw_ignore_stop_button(bool on) {
+//     tft->fillRoundRect(84, 150, 71, 28, 4, on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+//     tft->drawRect(90, 157, 14, 14, C_VINTAGE_CREAM);          // checkbox frame
+//     if (on) tft->fillRect(93, 160, 8, 8, C_VINTAGE_CREAM);    // checkmark
+//     tft->setTextSize(1);
+//     tft->setTextColor(C_VINTAGE_CREAM);
+//     tft->setTextDatum(middle_left);
+//     tft->drawString("IGNORE", 109, 159);
+//     tft->drawString("STOP", 109, 169);
+//     tft->setTextDatum(top_left);
+// }
 
 // Draw the static main-screen chrome: transport buttons (row 0) + HELP button (row 2).
 static void draw_main_chrome(void) {
@@ -1393,23 +1666,138 @@ static void draw_main_chrome(void) {
     tft->drawString("-", 202, 35);
     tft->fillRoundRect(245, 10, 65, 50, 5, C_VINTAGE_AMBER);
     tft->drawString("+", 277, 35);
-    // HELP button (row 2, right after the PPQN button)
+    // SETTINGS button (row 2, right after the PPQN button)
     tft->fillRoundRect(240, 150, 71, 28, 4, C_VINTAGE_RUST);
     tft->setTextSize(1);
-    tft->drawString("HELP", 240 + 71 / 2, 164);
+    tft->drawString("SETTINGS", 240 + 71 / 2, 164);
     tft->setTextDatum(top_left);
 }
 
-// FORGET WIFI button (bottom-right of the last help page). Two-tap: first tap
-// arms it (red, "CONFIRM FORGET"), second tap within FORGET_ARM_MS wipes the
-// stored WiFi credentials and reboots into the setup portal.
+// FORGET WIFI button (SETTINGS page). Two-tap: first tap arms it (red,
+// "CONFIRM FORGET"), second tap within FORGET_ARM_MS wipes the stored WiFi
+// credentials and reboots into the setup portal.
 #define FORGET_ARM_MS 5000
+#define FORGET_BTN_X 170
+#define FORGET_BTN_Y 172
+#define FORGET_BTN_W 130
+#define FORGET_BTN_H 26
 static void draw_forget_button(bool armed) {
-    tft->fillRoundRect(190, 208, 120, 24, 4, armed ? C_VINTAGE_RUST : C_VINTAGE_AMBER);
+    tft->fillRoundRect(FORGET_BTN_X, FORGET_BTN_Y, FORGET_BTN_W, FORGET_BTN_H, 4,
+                       armed ? C_VINTAGE_RUST : C_VINTAGE_AMBER);
     tft->setTextDatum(middle_center);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.2);
-    tft->drawString(armed ? "CONFIRM FORGET" : "FORGET WIFI", 190 + 120 / 2, 220);
+    tft->drawString(armed ? "CONFIRM FORGET" : "FORGET WIFI",
+                    FORGET_BTN_X + FORGET_BTN_W / 2, FORGET_BTN_Y + FORGET_BTN_H / 2);
+    tft->setTextDatum(top_left);
+}
+
+// Checkbox rows on the SETTINGS page. Each row: 18 px checkbox, label,
+// description line(s). Touch zone = the row's Y0..Y1, full width.
+#define SETTINGS_IGN_Y0   32
+#define SETTINGS_IGN_Y1   82
+#define SETTINGS_METRO_Y0 82
+#define SETTINGS_METRO_Y1 122
+static void draw_settings_checkbox(int y, bool on, const char *label) {
+    tft->drawRect(16, y, 18, 18, C_VINTAGE_CREAM);            // checkbox frame
+    if (on) tft->fillRect(20, y + 4, 10, 10, C_VINTAGE_FERN); // checkmark
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextDatum(middle_left);
+    tft->setTextSize(1.5);
+    tft->drawString(label, 44, y + 9);
+    tft->setTextDatum(top_left);
+    tft->setTextSize(1.2);
+}
+static void draw_settings_ignore_stop(bool on) {
+    tft->fillRect(0, SETTINGS_IGN_Y0, 320, SETTINGS_IGN_Y1 - SETTINGS_IGN_Y0, C_VINTAGE_BG);
+    draw_settings_checkbox(38, on, "IGNORE STOP");
+    tft->drawString("Refuse stops from Link, MIDI in, CV in.", 16, 60);
+    tft->drawString("Only BeatMesh's own STOP stops.", 16, 71);
+}
+// Channel button (right side of the MIDI METRONOME row): tap toggles 1 / 10.
+#define SETTINGS_METRO_CH_X 236
+static void draw_settings_midi_metro(bool on) {
+    tft->fillRect(0, SETTINGS_METRO_Y0, 320, SETTINGS_METRO_Y1 - SETTINGS_METRO_Y0, C_VINTAGE_BG);
+    draw_settings_checkbox(88, on, "MIDI METRONOME");
+    tft->drawString("Note 72 on beat 1, 64 on beats 2-4", 16, 110);
+    tft->fillRoundRect(SETTINGS_METRO_CH_X, 86, 68, 24, 4, C_VINTAGE_AMBER);
+    tft->setTextDatum(middle_center);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    tft->drawString((g_midi_metro_ch == 9) ? "CH 10" : "CH 1", SETTINGS_METRO_CH_X + 34, 98);
+    tft->setTextDatum(top_left);
+    tft->setTextSize(1.2);
+}
+
+// RANDOM MIDI block (bottom-left of the SETTINGS page): three checkboxes,
+// 24 px rows. BACK/HELP sit on the right so this column may run to y 222.
+#define SETTINGS_RAND_X1      160   // block spans x 0..160
+#define SETTINGS_RAND_DRUMS_Y 150   // rows: DRUMS 150..174, NOTES 174..198, CC 198..222
+#define SETTINGS_RAND_NOTES_Y 174
+#define SETTINGS_RAND_CC_Y    198
+static void draw_settings_checkbox_small(int y, bool on, const char *label) {
+    tft->drawRect(16, y + 3, 18, 18, C_VINTAGE_CREAM);
+    if (on) tft->fillRect(20, y + 7, 10, 10, C_VINTAGE_FERN);
+    tft->setTextDatum(middle_left);
+    tft->setTextSize(1.2);
+    tft->drawString(label, 42, y + 12);
+}
+static void draw_settings_random(void) {
+    tft->fillRect(0, 130, SETTINGS_RAND_X1, 94, C_VINTAGE_BG);
+    tft->setTextDatum(top_left);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    tft->drawString("RANDOM MIDI", 16, 130);
+    draw_settings_checkbox_small(SETTINGS_RAND_DRUMS_Y, g_rand_drums, "DRUMS ch 10");
+    draw_settings_checkbox_small(SETTINGS_RAND_NOTES_Y, g_rand_notes, "NOTES ch 1-6");
+    draw_settings_checkbox_small(SETTINGS_RAND_CC_Y,    g_rand_cc,    "CC random walk");
+    tft->setTextDatum(top_left);
+}
+
+// Full SETTINGS page: IGNORE STOP, MIDI METRONOME, RANDOM MIDI (left),
+// WiFi status + FORGET WIFI (right), BACK, HELP.
+static void draw_settings_page(void) {
+    tft->fillScreen(C_VINTAGE_BG);
+    tft->setTextDatum(top_left);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.7);
+    tft->drawString("SETTINGS", 16, 10);
+
+    draw_settings_ignore_stop(g_ignore_stop);
+    draw_settings_midi_metro(g_midi_metro);
+    tft->drawFastHLine(16, 126, 288, C_VINTAGE_BG_LT);
+    tft->drawFastVLine(SETTINGS_RAND_X1, 130, 92, C_VINTAGE_BG_LT);
+
+    // Bottom-left: RANDOM MIDI
+    draw_settings_random();
+
+    // Bottom-right: WiFi block + FORGET WIFI
+    tft->setTextDatum(top_left);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    tft->drawString("WIFI", FORGET_BTN_X, 130);
+    tft->setTextSize(1.2);
+    char wifi_line[80];
+    if (s_is_connected) {
+        snprintf(wifi_line, sizeof(wifi_line), "%.19s", s_ssid_name);   // 140 px wide column
+        tft->drawString(wifi_line, FORGET_BTN_X, 146);
+        tft->drawString(s_ip_str, FORGET_BTN_X, 157);
+    } else if (s_portal_active) {
+        tft->drawString("AP: BeatMesh", FORGET_BTN_X, 146);
+        tft->drawString("192.168.4.1", FORGET_BTN_X, 157);
+    } else {
+        tft->drawString("Connecting...", FORGET_BTN_X, 146);
+    }
+    draw_forget_button(false);
+
+    // Bottom row, right-aligned: HELP -> help pages, BACK -> main UI
+    tft->setTextDatum(middle_center);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    tft->fillRoundRect(200, 208, 52, 24, 4, C_VINTAGE_FERN);
+    tft->drawString("HELP", 200 + 52 / 2, 220);
+    tft->fillRoundRect(258, 208, 52, 24, 4, C_VINTAGE_RUST);
+    tft->drawString("BACK", 258 + 52 / 2, 220);
     tft->setTextDatum(top_left);
 }
 
@@ -1518,8 +1906,7 @@ static void draw_help_page(int page) {
         tft->drawString("workinprogress.ca", px, 168);
         tft->setTextColor(TFT_WHITE);
         tft->setTextDatum(bottom_right);
-        tft->drawString("version: " GIT_VERSION, 320 - px, 204); // above the button row
-        draw_forget_button(false);
+        tft->drawString("version: " GIT_VERSION, 320 - px, 240 - 6);
     }
 }
 
@@ -1547,7 +1934,7 @@ static void visual_task(void *param) {
     bool forget_armed = false;          // FORGET WIFI first tap done
     uint32_t forget_armed_at = 0;       // ms timestamp of that tap
     int last_play_border = -1;          // PLAY button border: -1 unknown, 0 off, 1 on
-    int last_ignore_stop = -1;          // IGNORE STOP checkbox: -1 forces first draw
+    // int last_ignore_stop = -1;       // main-page IGNORE STOP checkbox (moved to SETTINGS)
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -1575,7 +1962,6 @@ static void visual_task(void *param) {
         last_portal_state = !s_portal_active;
         last_mon_seq = 0xFFFFFFFFu;
         last_play_border = -1;
-        last_ignore_stop = -1;
     };
 
     while (true) {
@@ -1593,7 +1979,7 @@ static void visual_task(void *param) {
             abl_link_capture_app_session_state(s->link, s->session_state);
             bool current_playing = abl_link_is_playing(s->session_state);
             uint64_t now = abl_link_clock_micros(s->link);
-            if (current_playing) g_local_stop = true;  // BeatMesh's own control: stop allowed
+            if (current_playing) { g_local_stop_us = esp_timer_get_time(); g_local_stop = true; }  // own control: bypasses IGNORE STOP
             abl_link_set_is_playing(s->session_state, !current_playing, now);
             abl_link_commit_app_session_state(s->link, s->session_state);
             last_btn_time = esp_log_timestamp();
@@ -1604,19 +1990,62 @@ static void visual_task(void *param) {
         if (tft->getTouch(&tx, &ty)) {
             if (esp_log_timestamp() - last_touch > 300) {
               if (ui_screen == SCREEN_HELP) {
-                // BACK button (bottom-left) returns to the main UI
+                // BACK button (bottom-left) returns to the SETTINGS page
                 if (tx < 70 && ty >= 200) {
-                    ui_screen = SCREEN_MAIN;
+                    ui_screen = SCREEN_SETTINGS;
                     forget_armed = false;
-                    restore_main();
+                    draw_settings_page();
                 }
                 // NEXT button (bottom-right); absent on the last page
                 else if (help_page < HELP_PAGE_COUNT - 1 && tx >= 250 && ty >= 200) {
                     help_page++;
                     draw_help_page(help_page);
                 }
-                // FORGET WIFI button (last page only, bottom-right): two taps
-                else if (help_page == HELP_PAGE_COUNT - 1 && tx >= 180 && ty >= 200) {
+                last_touch = esp_log_timestamp();
+              } else if (ui_screen == SCREEN_SETTINGS) {
+                // BACK button (bottom-right) returns to the main UI
+                if (tx >= 250 && ty >= 200) {
+                    ui_screen = SCREEN_MAIN;
+                    forget_armed = false;
+                    restore_main();
+                }
+                // HELP button (left of BACK) opens the help pages
+                else if (tx >= 190 && tx < 250 && ty >= 200) {
+                    ui_screen = SCREEN_HELP;
+                    forget_armed = false;
+                    help_page = 0;
+                    draw_help_page(help_page);
+                }
+                // IGNORE STOP row: toggle
+                else if (ty >= SETTINGS_IGN_Y0 && ty < SETTINGS_IGN_Y1) {
+                    g_ignore_stop = !g_ignore_stop;
+                    draw_settings_ignore_stop(g_ignore_stop);
+                }
+                // MIDI METRONOME row: right side = channel 1/10, rest = on/off
+                else if (ty >= SETTINGS_METRO_Y0 && ty < SETTINGS_METRO_Y1) {
+                    if (tx >= SETTINGS_METRO_CH_X - 10) {
+                        g_midi_metro_ch = (g_midi_metro_ch == 9) ? 0 : 9;
+                    } else {
+                        g_midi_metro = !g_midi_metro;
+                    }
+                    draw_settings_midi_metro(g_midi_metro);
+                }
+                // RANDOM MIDI checkboxes (bottom-left)
+                else if (tx < SETTINGS_RAND_X1 && ty >= SETTINGS_RAND_DRUMS_Y && ty < SETTINGS_RAND_NOTES_Y) {
+                    g_rand_drums = !g_rand_drums;
+                    draw_settings_random();
+                }
+                else if (tx < SETTINGS_RAND_X1 && ty >= SETTINGS_RAND_NOTES_Y && ty < SETTINGS_RAND_CC_Y) {
+                    g_rand_notes = !g_rand_notes;
+                    draw_settings_random();
+                }
+                else if (tx < SETTINGS_RAND_X1 && ty >= SETTINGS_RAND_CC_Y && ty < SETTINGS_RAND_CC_Y + 24) {
+                    g_rand_cc = !g_rand_cc;
+                    draw_settings_random();
+                }
+                // FORGET WIFI button: two taps
+                else if (tx >= FORGET_BTN_X && tx < FORGET_BTN_X + FORGET_BTN_W &&
+                         ty >= FORGET_BTN_Y && ty < FORGET_BTN_Y + FORGET_BTN_H) {
                     if (forget_armed) {
                         wifi_forget_and_restart();
                     } else {
@@ -1644,12 +2073,10 @@ static void visual_task(void *param) {
                     if (false) {
                         // (placeholder so the branches below can be compiled out)
                     }
-#if !BEATMESH_METRONOME
-                    else if (tx >= 84 && tx < 155) {
-                        // IGNORE STOP checkbox
-                        g_ignore_stop = !g_ignore_stop;
-                    }
-#endif // !BEATMESH_METRONOME
+                    // IGNORE STOP checkbox on the main page: moved to SETTINGS
+                    // else if (tx >= 84 && tx < 155) {
+                    //     g_ignore_stop = !g_ignore_stop;
+                    // }
 #if BEATMESH_METRONOME
                     else if (tx >= 84 && tx < 155) {
                         // MET toggle button
@@ -1666,16 +2093,16 @@ static void visual_task(void *param) {
                         cv_ppqn_idx = (cv_ppqn_idx + 1) % cv_ppqn_count;
                         cv_ppqn = cv_ppqn_options[cv_ppqn_idx];
                     } else if (tx >= 240 && tx < 311) {
-                        // HELP button (row 2, right of PPQN): open help screens
-                        ui_screen = SCREEN_HELP;
-                        help_page = 0;
-                        draw_help_page(help_page);
+                        // SETTINGS button (row 2, right of PPQN): open settings page
+                        ui_screen = SCREEN_SETTINGS;
+                        forget_armed = false;
+                        draw_settings_page();
                     }
                     last_touch = esp_log_timestamp();
                 }
                 else if (ty < 70) {
                     if (tx < 85) {
-                        g_local_stop = true;  // BeatMesh's own control: stop allowed
+                        g_local_stop_us = esp_timer_get_time(); g_local_stop = true;  // own control: bypasses IGNORE STOP
                         abl_link_set_is_playing(s->session_state, false, now);
                         tft->drawRoundRect(10, 10, 70, 50, 5, C_VINTAGE_CREAM); 
                     }
@@ -1711,7 +2138,7 @@ static void visual_task(void *param) {
             // FORGET WIFI confirmation times out
             if (forget_armed && esp_log_timestamp() - forget_armed_at > FORGET_ARM_MS) {
                 forget_armed = false;
-                draw_forget_button(false);
+                if (ui_screen == SCREEN_SETTINGS) draw_forget_button(false);
             }
             vTaskDelay(pdMS_TO_TICKS(16));
             continue;
@@ -1820,13 +2247,11 @@ static void visual_task(void *param) {
             last_cv_ppqn = cv_ppqn;
         }
 
-#if !BEATMESH_METRONOME
-        // IGNORE STOP checkbox redraw (left side of row 2)
-        if ((int)g_ignore_stop != last_ignore_stop) {
-            draw_ignore_stop_button(g_ignore_stop);
-            last_ignore_stop = g_ignore_stop;
-        }
-#endif // !BEATMESH_METRONOME
+        // IGNORE STOP checkbox redraw on the main page: moved to SETTINGS
+        // if ((int)g_ignore_stop != last_ignore_stop) {
+        //     draw_ignore_stop_button(g_ignore_stop);
+        //     last_ignore_stop = g_ignore_stop;
+        // }
 
 #if BEATMESH_METRONOME
         // METRONOME button redraw (left side of row 2)
