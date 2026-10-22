@@ -119,6 +119,13 @@ static link_state_t g_link_state;
 enum midi_mode_t { MODE_LINK = 0, MODE_MIDI_CLK = 1, MODE_MIDI_THRU = 2, MODE_CV = 3, MODE_COUNT = 4 };
 static volatile int midi_mode = MODE_LINK;
 
+// IGNORE STOP: when set, stop requests coming from outside (Link peers, MIDI
+// in 0xFC, CV clock timeout) are refused and the transport is re-asserted as
+// playing. Only BeatMesh's own controls (TFT STOP, BOOT button, web STOP) can
+// stop; they set g_local_stop right before committing the stop.
+static volatile bool g_ignore_stop = false;
+static volatile bool g_local_stop = false;
+
 // Transport as seen by the MIDI/CV outputs, published by midi_clock_task for
 // the UI: 0 = stopped, 1 = play pressed but Start not sent yet (waiting for
 // the bar), 2 = Start sent, running.
@@ -449,6 +456,14 @@ static void midi_clock_task(void *param) {
         abl_link_capture_audio_session_state(s->link, midi_ss);
         now = abl_link_clock_micros(s->link);
         bool playing = abl_link_is_playing(midi_ss);
+        // IGNORE STOP: a stop that did not come from BeatMesh's own controls is
+        // refused. Re-assert play on the session so Link peers follow again.
+        if (!playing && g_ignore_stop && !g_local_stop) {
+            abl_link_set_is_playing(midi_ss, true, now);
+            abl_link_commit_audio_session_state(s->link, midi_ss);
+            playing = true;
+        }
+        if (playing) g_local_stop = false;  // local stop consumed (or play resumed)
         double beat = abl_link_beat_at_time(midi_ss, now, 1.0);
         int64_t now_us = (int64_t)esp_timer_get_time();
 
@@ -699,9 +714,11 @@ static void midi_in_task(void *param) {
             } else if (cv_playing && cv_last_pulse_us > 0 &&
                        (now - cv_last_pulse_us) > cv_timeout_us) {
                 // Clock stopped
-                abl_link_capture_app_session_state(s->link, midi_in_ss);
-                abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
-                abl_link_commit_app_session_state(s->link, midi_in_ss);
+                if (!g_ignore_stop) {  // IGNORE STOP: keep running without CV clock
+                    abl_link_capture_app_session_state(s->link, midi_in_ss);
+                    abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
+                    abl_link_commit_app_session_state(s->link, midi_in_ss);
+                }
                 cv_playing = false;
             }
             continue;
@@ -772,6 +789,7 @@ static void midi_in_task(void *param) {
                     abl_link_commit_app_session_state(s->link, midi_in_ss);
                     break;
                 case 0xFC:
+                    if (g_ignore_stop) break;  // IGNORE STOP: external stop refused
                     abl_link_capture_app_session_state(s->link, midi_in_ss);
                     abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
                     abl_link_commit_app_session_state(s->link, midi_in_ss);
@@ -841,6 +859,7 @@ static void midi_in_task(void *param) {
             break;
 
         case 0xFC: // Stop
+            if (g_ignore_stop) break;  // IGNORE STOP: refused, not forwarded either
             uart_write_bytes(MIDI_UART, (const char *)&byte, 1);
             abl_link_capture_app_session_state(s->link, midi_in_ss);
             abl_link_set_is_playing(midi_in_ss, false, abl_link_clock_micros(s->link));
@@ -966,6 +985,7 @@ static esp_err_t set_transport_handler(httpd_req_t *req) {
             bool is_playing = (strcmp(state_val, "play") == 0);
             abl_link_capture_app_session_state(g_link_state.link, g_web_ss);
             uint64_t now = abl_link_clock_micros(g_link_state.link);
+            if (!is_playing) g_local_stop = true;  // BeatMesh's own control: stop allowed
             abl_link_set_is_playing(g_web_ss, is_playing, now);
             abl_link_commit_app_session_state(g_link_state.link, g_web_ss);
         }
@@ -1085,6 +1105,9 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
             int m = atoi(val);
             if (m >= 0 && m <= 3) midi_mode = m;
         }
+        if (httpd_query_key_value(buf, "ignstop", val, sizeof(val)) == ESP_OK) {
+            g_ignore_stop = (atoi(val) != 0);
+        }
         if (httpd_query_key_value(buf, "ppqn", val, sizeof(val)) == ESP_OK) {
             int p = atoi(val);
             if (p >= 0 && p < cv_ppqn_count) {
@@ -1141,6 +1164,13 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "<a href='/set_mode?ppqn=%d' class='mbtn' style='background:#E64833;color:#FBE9D0;'>%s</a>",
         next_ppqn_idx, ppqn_labels[cur_ppqn_idx]);
 
+    // Ignore-stop toggle button
+    char ignstop_btn[128];
+    bool cur_ignstop = g_ignore_stop;
+    const char *ignstop_style = cur_ignstop ? "background:#6D9773;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+    snprintf(ignstop_btn, sizeof(ignstop_btn),
+        "<a href='/set_mode?ignstop=%d' class='mbtn' style='%s'>%s</a>", cur_ignstop ? 0 : 1, ignstop_style, cur_ignstop ? "ON" : "OFF");
+
 #if BEATMESH_METRONOME
     // Metronome toggle button
     char metro_btn[128];
@@ -1196,6 +1226,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
                 "<hr style='border:0;border-top:1px solid #874F41;margin:12px 0'>"
                 "<div class='sel-row'>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>PPQN: </span>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>IGNORE STOP: </span>%s</div>"
 #if BEATMESH_METRONOME
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>METRONOME: </span>%s</div>"
 #endif // BEATMESH_METRONOME
@@ -1242,7 +1273,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "</script>"
         "</body></html>",
         peers, conn_str,
-        mode_btns, ppqn_btns,
+        mode_btns, ppqn_btns, ignstop_btn,
 #if BEATMESH_METRONOME
         metro_btn,
 #endif // BEATMESH_METRONOME
@@ -1334,6 +1365,20 @@ enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1 };
 //#ifndef GIT_VERSION
 //#define GIT_VERSION "unknown"
 //#endif
+
+// IGNORE STOP checkbox (row 2, left of PPQN; same slot as the optional
+// METRONOME button, which takes precedence when BEATMESH_METRONOME is 1).
+static void draw_ignore_stop_button(bool on) {
+    tft->fillRoundRect(84, 150, 71, 28, 4, on ? C_VINTAGE_FERN : C_VINTAGE_BG_LT);
+    tft->drawRect(90, 157, 14, 14, C_VINTAGE_CREAM);          // checkbox frame
+    if (on) tft->fillRect(93, 160, 8, 8, C_VINTAGE_CREAM);    // checkmark
+    tft->setTextSize(1);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextDatum(middle_left);
+    tft->drawString("IGNORE", 109, 159);
+    tft->drawString("STOP", 109, 169);
+    tft->setTextDatum(top_left);
+}
 
 // Draw the static main-screen chrome: transport buttons (row 0) + HELP button (row 2).
 static void draw_main_chrome(void) {
@@ -1502,6 +1547,7 @@ static void visual_task(void *param) {
     bool forget_armed = false;          // FORGET WIFI first tap done
     uint32_t forget_armed_at = 0;       // ms timestamp of that tap
     int last_play_border = -1;          // PLAY button border: -1 unknown, 0 off, 1 on
+    int last_ignore_stop = -1;          // IGNORE STOP checkbox: -1 forces first draw
 
     tft = new LGFX_CYD();
     tft->init(); 
@@ -1529,6 +1575,7 @@ static void visual_task(void *param) {
         last_portal_state = !s_portal_active;
         last_mon_seq = 0xFFFFFFFFu;
         last_play_border = -1;
+        last_ignore_stop = -1;
     };
 
     while (true) {
@@ -1546,6 +1593,7 @@ static void visual_task(void *param) {
             abl_link_capture_app_session_state(s->link, s->session_state);
             bool current_playing = abl_link_is_playing(s->session_state);
             uint64_t now = abl_link_clock_micros(s->link);
+            if (current_playing) g_local_stop = true;  // BeatMesh's own control: stop allowed
             abl_link_set_is_playing(s->session_state, !current_playing, now);
             abl_link_commit_app_session_state(s->link, s->session_state);
             last_btn_time = esp_log_timestamp();
@@ -1594,8 +1642,14 @@ static void visual_task(void *param) {
                 }
                 else if (ty >= 150 && ty < 178) {
                     if (false) {
-                        // (placeholder so the METRONOME branch below can be compiled out)
+                        // (placeholder so the branches below can be compiled out)
                     }
+#if !BEATMESH_METRONOME
+                    else if (tx >= 84 && tx < 155) {
+                        // IGNORE STOP checkbox
+                        g_ignore_stop = !g_ignore_stop;
+                    }
+#endif // !BEATMESH_METRONOME
 #if BEATMESH_METRONOME
                     else if (tx >= 84 && tx < 155) {
                         // MET toggle button
@@ -1621,6 +1675,7 @@ static void visual_task(void *param) {
                 }
                 else if (ty < 70) {
                     if (tx < 85) {
+                        g_local_stop = true;  // BeatMesh's own control: stop allowed
                         abl_link_set_is_playing(s->session_state, false, now);
                         tft->drawRoundRect(10, 10, 70, 50, 5, C_VINTAGE_CREAM); 
                     }
@@ -1764,6 +1819,14 @@ static void visual_task(void *param) {
             last_midi_mode = midi_mode;
             last_cv_ppqn = cv_ppqn;
         }
+
+#if !BEATMESH_METRONOME
+        // IGNORE STOP checkbox redraw (left side of row 2)
+        if ((int)g_ignore_stop != last_ignore_stop) {
+            draw_ignore_stop_button(g_ignore_stop);
+            last_ignore_stop = g_ignore_stop;
+        }
+#endif // !BEATMESH_METRONOME
 
 #if BEATMESH_METRONOME
         // METRONOME button redraw (left side of row 2)
