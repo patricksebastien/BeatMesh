@@ -106,8 +106,8 @@ static httpd_handle_t s_http_server = NULL; // web server runs in AP portal and 
 // --- Mode/PPQN button layout (y=100, h=40) ---
 static const int mode_btn_x[] = { 10, 86, 162, 238 };
 static const int mode_btn_w[] = { 71, 71, 71, 72 };
-static const int ppqn_btn_x = 162;   // single cycling button (tap to advance), right after METRONOME
-static const int ppqn_btn_w = 71;
+static const int ppqn_btn_x = 150;   // single cycling button (tap to advance), right after METRONOME
+static const int ppqn_btn_w = 62;
 static const char *mode_labels[] = { "LINK", "MIDI", "THR", "CV" };
 static const char *ppqn_labels[] = { "1", "2", "4", "8", "24", "48" };
 
@@ -138,6 +138,18 @@ static volatile int  g_midi_metro_ch = 0;   // 0-based: 0 = channel 1, 9 = chann
 #define MIDI_METRO_NOTE_BEAT  64      // beats 2-4
 #define MIDI_METRO_VEL        100
 #define MIDI_METRO_GATE_US    40000   // 40 ms note length
+
+// TUNER: one long note on the MIDI outputs, note on at the downbeat of every
+// bar, note off right before the next downbeat's note on (so it sounds
+// continuously, retriggered once per bar). The note is one of the six open
+// guitar strings, picked with a cycling button (settings page + web).
+static volatile bool g_tuner = false;
+static volatile int  g_tuner_idx = 1;   // index into tuner_notes (default A2)
+static const uint8_t tuner_notes[]  = { 40, 45, 50, 55, 59, 64 };   // E2 A2 D3 G3 B3 E4
+static const char   *tuner_labels[] = { "E2", "A2", "D3", "G3", "B3", "E4" };
+static const int     tuner_count    = 6;
+#define TUNER_CH    0      // 0-based: channel 1
+#define TUNER_VEL   100
 
 // RANDOM MIDI (fun). NOTES: on every beat one random pentatonic note, random
 // length, on a random channel 1..RANDOM_MIDI_NUM_CH. CC: RANDOM_MIDI_NUM_CC
@@ -511,6 +523,12 @@ static void midi_clock_task(void *param) {
     int metro_note_ch = 0;
     int64_t metro_off_us = 0;
 
+    // Tuner: note currently sounding (-1 none)
+    int tuner_note = -1;
+    auto tuner_off = [&]() {
+        if (tuner_note >= 0) { midi_send_note_off(TUNER_CH, tuner_note); tuner_note = -1; }
+    };
+
     // Random MIDI: per-channel note currently sounding (-1 none) and its
     // note-off time; CC walkers (picked when the box turns on)
     int rnd_note[RANDOM_MIDI_NUM_CH];
@@ -688,6 +706,7 @@ static void midi_clock_task(void *param) {
                 midi_send_note_off(metro_note_ch, metro_note);
                 metro_note = -1;
             }
+            tuner_off();
             rnd_all_notes_off();
             drums_off();
             midi_was_active = false;
@@ -706,6 +725,7 @@ static void midi_clock_task(void *param) {
             }
         }
         if (drum_count > 0 && now_us >= drum_off_us) drums_off();
+        if (!g_tuner) tuner_off();  // box turned off: release the held note
 
         // Re-sync after returning from MIDI-in mode
         if (!midi_was_active) {
@@ -728,6 +748,7 @@ static void midi_clock_task(void *param) {
                 midi_send_note_off(metro_note_ch, metro_note);
                 metro_note = -1;
             }
+            tuner_off();
             rnd_all_notes_off();
             drums_off();
         }
@@ -748,6 +769,19 @@ static void midi_clock_task(void *param) {
                     metro_note = note;
                     metro_off_us = now_us + MIDI_METRO_GATE_US;
                 }
+                // TUNER: long open-string note, note on at the downbeat of
+                // the 4-beat bar, note off right before the next downbeat's
+                // note on. When turned on or the string is changed mid-bar
+                // it switches at the next beat instead.
+                if (g_tuner && (ticks % 24) == 0) {
+                    int bar_beat = (int)floor(abl_link_phase_at_time(midi_ss, now, 4.0) + 0.05) % 4;
+                    int want = tuner_notes[g_tuner_idx % tuner_count];
+                    if (bar_beat == 0 || tuner_note != want) {
+                        tuner_off();
+                        midi_send_note_on(TUNER_CH, want, TUNER_VEL);
+                        tuner_note = want;
+                    }
+                }
                 // DRUMS, on the 8th-note grid (12 ticks). Step within the bar
                 // from the quantum-4 phase; +0.05 beat guards the float edge.
                 if (g_rand_drums && (ticks % 12) == 0) {
@@ -767,14 +801,15 @@ static void midi_clock_task(void *param) {
                     drum_off_us = now_us + DRUM_GATE_US;
                 }
 
-                // Random MIDI. NOTES on every 8th note (12 ticks): C major
-                // pentatonic (C3..A5), length 1/8 .. 1 beat, on random distinct
+                // Random MIDI. NOTES on every 8th note (12 ticks): C minor
+                // pentatonic (C2..Bb4), length 1/8 .. 1 beat, on random distinct
                 // channels 1..6, one voice per channel. CC once per beat: each
                 // walker nudged by -12..+12.
                 if (!g_rand_cc) rnd_cc_active = false;  // next enable picks a new CC set
                 if ((g_rand_notes && (ticks % 12) == 0) || (g_rand_cc && (ticks % 24) == 0)) {
                     if (g_rand_notes && (ticks % 12) == 0) {
-                        static const uint8_t penta[5] = { 0, 2, 4, 7, 9 };
+                        static const uint8_t penta[5] = { 0, 3, 5, 7, 10 };   // C minor pentatonic
+                        // static const uint8_t penta[5] = { 0, 2, 4, 7, 9 };  // C major pentatonic
                         int64_t beat_us = (int64_t)(60000000.0 / abl_link_tempo(midi_ss));
                         // How many notes this step: weighted 1/2/3/4, never more
                         uint32_t r = esp_random();
@@ -791,7 +826,7 @@ static void midi_clock_task(void *param) {
                         for (int k = 0; k < n; k++) {
                             int ch = chs[k];
                             uint32_t rn = esp_random();
-                            uint8_t note = 48 + ((rn >> 8) % 3) * 12 + penta[rn % 5];
+                            uint8_t note = 36 + ((rn >> 8) % 3) * 12 + penta[rn % 5];   // C2 base, 3 octaves
                             uint8_t vel = 70 + ((rn >> 16) % 50);
                             if (rnd_note[ch] >= 0) midi_send_note_off(ch, rnd_note[ch]);
                             midi_send_note_on(ch, note, vel);
@@ -1344,6 +1379,13 @@ static esp_err_t set_mode_handler(httpd_req_t *req) {
         if (httpd_query_key_value(buf, "mmetro", val, sizeof(val)) == ESP_OK) {
             g_midi_metro = (atoi(val) != 0);
         }
+        if (httpd_query_key_value(buf, "tuner", val, sizeof(val)) == ESP_OK) {
+            g_tuner = (atoi(val) != 0);
+        }
+        if (httpd_query_key_value(buf, "tunerstr", val, sizeof(val)) == ESP_OK) {
+            int t = atoi(val);
+            if (t >= 0 && t < tuner_count) g_tuner_idx = t;
+        }
         if (httpd_query_key_value(buf, "rdrums", val, sizeof(val)) == ESP_OK) {
             g_rand_drums = (atoi(val) != 0);
         }
@@ -1430,6 +1472,17 @@ static esp_err_t get_handler(httpd_req_t *req) {
         cur_mmetro ? 0 : 1, mmetro_style, cur_mmetro ? "ON" : "OFF",
         cur_mmetro_ch == 1 ? 10 : 1, cur_mmetro_ch);
 
+    // Tuner toggle button + string cycle button (E2 A2 D3 G3 B3 E4)
+    char tuner_btn[256];
+    bool cur_tuner = g_tuner;
+    int cur_tuner_idx = g_tuner_idx % tuner_count;
+    const char *tuner_style = cur_tuner ? "background:#6D9773;color:#FBE9D0;" : "background:#1e3b46;color:#90AEAD;";
+    snprintf(tuner_btn, sizeof(tuner_btn),
+        "<a href='/set_mode?tuner=%d' class='mbtn' style='%s'>%s</a>"
+        "<a href='/set_mode?tunerstr=%d' class='mbtn' style='background:#E64833;color:#FBE9D0;'>%s</a>",
+        cur_tuner ? 0 : 1, tuner_style, cur_tuner ? "ON" : "OFF",
+        (cur_tuner_idx + 1) % tuner_count, tuner_labels[cur_tuner_idx]);
+
     // Random MIDI toggle buttons (notes, cc)
     char rand_btns[384];
     const char *on_style  = "background:#6D9773;color:#FBE9D0;";
@@ -1499,6 +1552,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>PPQN: </span>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>IGNORE STOP: </span>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>MIDI METRONOME: </span>%s</div>"
+                "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>TUNER (ch 1): </span>%s</div>"
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>RANDOM MIDI: </span>%s</div>"
 #if BEATMESH_METRONOME
                 "<div class='sel-row'><span style='font-size:12px;color:#90AEAD'>METRONOME: </span>%s</div>"
@@ -1546,7 +1600,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
         "</script>"
         "</body></html>",
         peers, conn_str,
-        mode_btns, ppqn_btns, ignstop_btn, mmetro_btn, rand_btns,
+        mode_btns, ppqn_btns, ignstop_btn, mmetro_btn, tuner_btn, rand_btns,
 #if BEATMESH_METRONOME
         metro_btn,
 #endif // BEATMESH_METRONOME
@@ -1653,7 +1707,13 @@ enum ui_screen_t { SCREEN_MAIN = 0, SCREEN_HELP = 1, SCREEN_SETTINGS = 2 };
 //     tft->setTextDatum(top_left);
 // }
 
-// Draw the static main-screen chrome: transport buttons (row 0) + HELP button (row 2).
+// Draw the static main-screen chrome: transport buttons (row 0) + SETTINGS/HELP buttons (row 2).
+// Row 2 (y 150..178): MIDI monitor 10..80, METRONOME 84..146, PPQN 150..212,
+// SETTINGS 216..270, HELP 274..311.
+#define MAIN_SET_BTN_X  216
+#define MAIN_SET_BTN_W  54
+#define MAIN_HELP_BTN_X 274
+#define MAIN_HELP_BTN_W 37
 static void draw_main_chrome(void) {
     tft->setTextSize(2);
     tft->setTextColor(C_VINTAGE_CREAM);
@@ -1667,9 +1727,12 @@ static void draw_main_chrome(void) {
     tft->fillRoundRect(245, 10, 65, 50, 5, C_VINTAGE_AMBER);
     tft->drawString("+", 277, 35);
     // SETTINGS button (row 2, right after the PPQN button)
-    tft->fillRoundRect(240, 150, 71, 28, 4, C_VINTAGE_RUST);
+    tft->fillRoundRect(MAIN_SET_BTN_X, 150, MAIN_SET_BTN_W, 28, 4, C_VINTAGE_RUST);
     tft->setTextSize(1);
-    tft->drawString("SETTINGS", 240 + 71 / 2, 164);
+    tft->drawString("SETTINGS", MAIN_SET_BTN_X + MAIN_SET_BTN_W / 2, 164);
+    // HELP button (row 2, right of SETTINGS) -> help pages
+    tft->fillRoundRect(MAIN_HELP_BTN_X, 150, MAIN_HELP_BTN_W, 28, 4, C_VINTAGE_FERN);
+    tft->drawString("HELP", MAIN_HELP_BTN_X + MAIN_HELP_BTN_W / 2, 164);
     tft->setTextDatum(top_left);
 }
 
@@ -1678,7 +1741,7 @@ static void draw_main_chrome(void) {
 // credentials and reboots into the setup portal.
 #define FORGET_ARM_MS 5000
 #define FORGET_BTN_X 170
-#define FORGET_BTN_Y 172
+#define FORGET_BTN_Y 170
 #define FORGET_BTN_W 130
 #define FORGET_BTN_H 26
 static void draw_forget_button(bool armed) {
@@ -1694,10 +1757,12 @@ static void draw_forget_button(bool armed) {
 
 // Checkbox rows on the SETTINGS page. Each row: 18 px checkbox, label,
 // description line(s). Touch zone = the row's Y0..Y1, full width.
-#define SETTINGS_IGN_Y0   32
-#define SETTINGS_IGN_Y1   82
-#define SETTINGS_METRO_Y0 82
-#define SETTINGS_METRO_Y1 122
+#define SETTINGS_IGN_Y0   26
+#define SETTINGS_IGN_Y1   60
+#define SETTINGS_METRO_Y0 60
+#define SETTINGS_METRO_Y1 96
+#define SETTINGS_TUNER_Y0 96
+#define SETTINGS_TUNER_Y1 120
 static void draw_settings_checkbox(int y, bool on, const char *label) {
     tft->drawRect(16, y, 18, 18, C_VINTAGE_CREAM);            // checkbox frame
     if (on) tft->fillRect(20, y + 4, 10, 10, C_VINTAGE_FERN); // checkmark
@@ -1710,31 +1775,49 @@ static void draw_settings_checkbox(int y, bool on, const char *label) {
 }
 static void draw_settings_ignore_stop(bool on) {
     tft->fillRect(0, SETTINGS_IGN_Y0, 320, SETTINGS_IGN_Y1 - SETTINGS_IGN_Y0, C_VINTAGE_BG);
-    draw_settings_checkbox(38, on, "IGNORE STOP");
-    tft->drawString("Refuse stops from Link, MIDI in, CV in.", 16, 60);
-    tft->drawString("Only BeatMesh's own STOP stops.", 16, 71);
+    draw_settings_checkbox(28, on, "IGNORE STOP");
+    tft->drawString("Refuse stops from Link, MIDI in, CV in.", 16, 48);
+    // tft->drawString("Only BeatMesh's own STOP stops.", 16, 71);
 }
 // Channel button (right side of the MIDI METRONOME row): tap toggles 1 / 10.
 #define SETTINGS_METRO_CH_X 236
 static void draw_settings_midi_metro(bool on) {
     tft->fillRect(0, SETTINGS_METRO_Y0, 320, SETTINGS_METRO_Y1 - SETTINGS_METRO_Y0, C_VINTAGE_BG);
-    draw_settings_checkbox(88, on, "MIDI METRONOME");
-    tft->drawString("Note 72 on beat 1, 64 on beats 2-4", 16, 110);
-    tft->fillRoundRect(SETTINGS_METRO_CH_X, 86, 68, 24, 4, C_VINTAGE_AMBER);
+    draw_settings_checkbox(62, on, "MIDI METRONOME");
+    tft->drawString("Note 72 on beat 1, 64 on beats 2-4", 16, 83);
+    tft->fillRoundRect(SETTINGS_METRO_CH_X, 59, 68, 24, 4, C_VINTAGE_AMBER);
     tft->setTextDatum(middle_center);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.5);
-    tft->drawString((g_midi_metro_ch == 9) ? "CH 10" : "CH 1", SETTINGS_METRO_CH_X + 34, 98);
+    tft->drawString((g_midi_metro_ch == 9) ? "CH 10" : "CH 1", SETTINGS_METRO_CH_X + 34, 71);
+    tft->setTextDatum(top_left);
+    tft->setTextSize(1.2);
+}
+// TUNER row: single line, description right of the label, string button
+// on the right (same column as the metronome CH button): tap cycles
+// E2 A2 D3 G3 B3 E4.
+static void draw_settings_tuner(bool on) {
+    tft->fillRect(0, SETTINGS_TUNER_Y0, 320, SETTINGS_TUNER_Y1 - SETTINGS_TUNER_Y0, C_VINTAGE_BG);
+    draw_settings_checkbox(99, on, "TUNER");
+    tft->setTextDatum(middle_left);
+    tft->drawString("ch 1, 1 note/bar", 100, 108);
+    tft->fillRoundRect(SETTINGS_METRO_CH_X, 97, 68, 22, 4, C_VINTAGE_AMBER);
+    tft->setTextDatum(middle_center);
+    tft->setTextColor(C_VINTAGE_CREAM);
+    tft->setTextSize(1.5);
+    tft->drawString(tuner_labels[g_tuner_idx % tuner_count], SETTINGS_METRO_CH_X + 34, 108);
     tft->setTextDatum(top_left);
     tft->setTextSize(1.2);
 }
 
 // RANDOM MIDI block (bottom-left of the SETTINGS page): three checkboxes,
-// 24 px rows. BACK/HELP sit on the right so this column may run to y 222.
+// 24 px rows. BACK sits on the right so this column may run to y 240
+// (room for a fourth row at 216..240).
 #define SETTINGS_RAND_X1      160   // block spans x 0..160
-#define SETTINGS_RAND_DRUMS_Y 150   // rows: DRUMS 150..174, NOTES 174..198, CC 198..222
-#define SETTINGS_RAND_NOTES_Y 174
-#define SETTINGS_RAND_CC_Y    198
+#define SETTINGS_RAND_Y0      128   // title row
+#define SETTINGS_RAND_DRUMS_Y 144   // rows: DRUMS 144..168, NOTES 168..192, CC 192..216
+#define SETTINGS_RAND_NOTES_Y 168
+#define SETTINGS_RAND_CC_Y    192
 static void draw_settings_checkbox_small(int y, bool on, const char *label) {
     tft->drawRect(16, y + 3, 18, 18, C_VINTAGE_CREAM);
     if (on) tft->fillRect(20, y + 7, 10, 10, C_VINTAGE_FERN);
@@ -1743,30 +1826,31 @@ static void draw_settings_checkbox_small(int y, bool on, const char *label) {
     tft->drawString(label, 42, y + 12);
 }
 static void draw_settings_random(void) {
-    tft->fillRect(0, 130, SETTINGS_RAND_X1, 94, C_VINTAGE_BG);
+    tft->fillRect(0, SETTINGS_RAND_Y0, SETTINGS_RAND_X1, 240 - SETTINGS_RAND_Y0, C_VINTAGE_BG);
     tft->setTextDatum(top_left);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.5);
-    tft->drawString("RANDOM MIDI", 16, 130);
+    tft->drawString("RANDOM MIDI", 16, SETTINGS_RAND_Y0);
     draw_settings_checkbox_small(SETTINGS_RAND_DRUMS_Y, g_rand_drums, "DRUMS ch 10");
     draw_settings_checkbox_small(SETTINGS_RAND_NOTES_Y, g_rand_notes, "NOTES ch 1-6");
     draw_settings_checkbox_small(SETTINGS_RAND_CC_Y,    g_rand_cc,    "CC random walk");
     tft->setTextDatum(top_left);
 }
 
-// Full SETTINGS page: IGNORE STOP, MIDI METRONOME, RANDOM MIDI (left),
-// WiFi status + FORGET WIFI (right), BACK, HELP.
+// Full SETTINGS page: IGNORE STOP, MIDI METRONOME, TUNER, RANDOM MIDI (left),
+// WiFi status + FORGET WIFI (right), BACK. (HELP moved to the main page.)
 static void draw_settings_page(void) {
     tft->fillScreen(C_VINTAGE_BG);
     tft->setTextDatum(top_left);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.7);
-    tft->drawString("SETTINGS", 16, 10);
+    tft->drawString("SETTINGS", 16, 8);
 
     draw_settings_ignore_stop(g_ignore_stop);
     draw_settings_midi_metro(g_midi_metro);
-    tft->drawFastHLine(16, 126, 288, C_VINTAGE_BG_LT);
-    tft->drawFastVLine(SETTINGS_RAND_X1, 130, 92, C_VINTAGE_BG_LT);
+    draw_settings_tuner(g_tuner);
+    tft->drawFastHLine(16, 124, 288, C_VINTAGE_BG_LT);
+    tft->drawFastVLine(SETTINGS_RAND_X1, SETTINGS_RAND_Y0, 240 - SETTINGS_RAND_Y0, C_VINTAGE_BG_LT);
 
     // Bottom-left: RANDOM MIDI
     draw_settings_random();
@@ -1775,27 +1859,27 @@ static void draw_settings_page(void) {
     tft->setTextDatum(top_left);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.5);
-    tft->drawString("WIFI", FORGET_BTN_X, 130);
+    tft->drawString("WIFI", FORGET_BTN_X, SETTINGS_RAND_Y0);
     tft->setTextSize(1.2);
     char wifi_line[80];
     if (s_is_connected) {
         snprintf(wifi_line, sizeof(wifi_line), "%.19s", s_ssid_name);   // 140 px wide column
-        tft->drawString(wifi_line, FORGET_BTN_X, 146);
-        tft->drawString(s_ip_str, FORGET_BTN_X, 157);
+        tft->drawString(wifi_line, FORGET_BTN_X, 144);
+        tft->drawString(s_ip_str, FORGET_BTN_X, 155);
     } else if (s_portal_active) {
-        tft->drawString("AP: BeatMesh", FORGET_BTN_X, 146);
-        tft->drawString("192.168.4.1", FORGET_BTN_X, 157);
+        tft->drawString("AP: BeatMesh", FORGET_BTN_X, 144);
+        tft->drawString("192.168.4.1", FORGET_BTN_X, 155);
     } else {
-        tft->drawString("Connecting...", FORGET_BTN_X, 146);
+        tft->drawString("Connecting...", FORGET_BTN_X, 144);
     }
     draw_forget_button(false);
 
-    // Bottom row, right-aligned: HELP -> help pages, BACK -> main UI
+    // Bottom row, right-aligned: BACK -> main UI. (HELP moved to the main page.)
     tft->setTextDatum(middle_center);
     tft->setTextColor(C_VINTAGE_CREAM);
     tft->setTextSize(1.5);
-    tft->fillRoundRect(200, 208, 52, 24, 4, C_VINTAGE_FERN);
-    tft->drawString("HELP", 200 + 52 / 2, 220);
+    // tft->fillRoundRect(200, 208, 52, 24, 4, C_VINTAGE_FERN);
+    // tft->drawString("HELP", 200 + 52 / 2, 220);
     tft->fillRoundRect(258, 208, 52, 24, 4, C_VINTAGE_RUST);
     tft->drawString("BACK", 258 + 52 / 2, 220);
     tft->setTextDatum(top_left);
@@ -1990,11 +2074,11 @@ static void visual_task(void *param) {
         if (tft->getTouch(&tx, &ty)) {
             if (esp_log_timestamp() - last_touch > 300) {
               if (ui_screen == SCREEN_HELP) {
-                // BACK button (bottom-left) returns to the SETTINGS page
+                // BACK button (bottom-left) returns to the main UI
                 if (tx < 70 && ty >= 200) {
-                    ui_screen = SCREEN_SETTINGS;
+                    ui_screen = SCREEN_MAIN;
                     forget_armed = false;
-                    draw_settings_page();
+                    restore_main();
                 }
                 // NEXT button (bottom-right); absent on the last page
                 else if (help_page < HELP_PAGE_COUNT - 1 && tx >= 250 && ty >= 200) {
@@ -2009,13 +2093,13 @@ static void visual_task(void *param) {
                     forget_armed = false;
                     restore_main();
                 }
-                // HELP button (left of BACK) opens the help pages
-                else if (tx >= 190 && tx < 250 && ty >= 200) {
-                    ui_screen = SCREEN_HELP;
-                    forget_armed = false;
-                    help_page = 0;
-                    draw_help_page(help_page);
-                }
+                // HELP button (left of BACK): moved to the main page
+                // else if (tx >= 190 && tx < 250 && ty >= 200) {
+                //     ui_screen = SCREEN_HELP;
+                //     forget_armed = false;
+                //     help_page = 0;
+                //     draw_help_page(help_page);
+                // }
                 // IGNORE STOP row: toggle
                 else if (ty >= SETTINGS_IGN_Y0 && ty < SETTINGS_IGN_Y1) {
                     g_ignore_stop = !g_ignore_stop;
@@ -2029,6 +2113,15 @@ static void visual_task(void *param) {
                         g_midi_metro = !g_midi_metro;
                     }
                     draw_settings_midi_metro(g_midi_metro);
+                }
+                // TUNER row: right side = next string, rest = on/off
+                else if (ty >= SETTINGS_TUNER_Y0 && ty < SETTINGS_TUNER_Y1) {
+                    if (tx >= SETTINGS_METRO_CH_X - 10) {
+                        g_tuner_idx = (g_tuner_idx + 1) % tuner_count;
+                    } else {
+                        g_tuner = !g_tuner;
+                    }
+                    draw_settings_tuner(g_tuner);
                 }
                 // RANDOM MIDI checkboxes (bottom-left)
                 else if (tx < SETTINGS_RAND_X1 && ty >= SETTINGS_RAND_DRUMS_Y && ty < SETTINGS_RAND_NOTES_Y) {
@@ -2078,7 +2171,7 @@ static void visual_task(void *param) {
                     //     g_ignore_stop = !g_ignore_stop;
                     // }
 #if BEATMESH_METRONOME
-                    else if (tx >= 84 && tx < 155) {
+                    else if (tx >= 84 && tx < 148) {
                         // MET toggle button
                         metronome_enabled = !metronome_enabled;
                         if (!metronome_enabled) {
@@ -2092,11 +2185,17 @@ static void visual_task(void *param) {
                         // PPQN cycle button (row 2): advance to next option
                         cv_ppqn_idx = (cv_ppqn_idx + 1) % cv_ppqn_count;
                         cv_ppqn = cv_ppqn_options[cv_ppqn_idx];
-                    } else if (tx >= 240 && tx < 311) {
+                    } else if (tx >= MAIN_SET_BTN_X && tx < MAIN_HELP_BTN_X - 2) {
                         // SETTINGS button (row 2, right of PPQN): open settings page
                         ui_screen = SCREEN_SETTINGS;
                         forget_armed = false;
                         draw_settings_page();
+                    } else if (tx >= MAIN_HELP_BTN_X - 2 && tx < 320) {
+                        // HELP button (row 2, right of SETTINGS): open help pages
+                        ui_screen = SCREEN_HELP;
+                        forget_armed = false;
+                        help_page = 0;
+                        draw_help_page(help_page);
                     }
                     last_touch = esp_log_timestamp();
                 }
@@ -2238,10 +2337,10 @@ static void visual_task(void *param) {
             tft->setTextColor(C_VINTAGE_CREAM);
             tft->setTextSize(1);
             tft->setTextDatum(middle_left);
-            tft->drawString("PPQN", ppqn_btn_x + 6, 164);
+            tft->drawString("PPQN", ppqn_btn_x + 4, 164);
             tft->setTextSize(2);
             tft->setTextDatum(middle_right);
-            tft->drawString(ppqn_labels[cv_ppqn_idx], ppqn_btn_x + ppqn_btn_w - 6, 164);
+            tft->drawString(ppqn_labels[cv_ppqn_idx], ppqn_btn_x + ppqn_btn_w - 4, 164);
             tft->setTextDatum(top_left);
             last_midi_mode = midi_mode;
             last_cv_ppqn = cv_ppqn;
@@ -2258,11 +2357,11 @@ static void visual_task(void *param) {
         if (metronome_enabled != last_metro_enabled) {
             uint16_t bg = metronome_enabled ? C_VINTAGE_FERN : C_VINTAGE_BG_LT;
             uint16_t fg = C_VINTAGE_CREAM; // always white text, even when inactive
-            tft->fillRoundRect(84, 150, 71, 28, 4, bg);
+            tft->fillRoundRect(84, 150, 62, 28, 4, bg);
             tft->setTextSize(1);
             tft->setTextColor(fg);
             tft->setTextDatum(middle_center);
-            tft->drawString("METRONOME", 119, 164);
+            tft->drawString("METRONOME", 84 + 62 / 2, 164);
             tft->setTextDatum(top_left);
             last_metro_enabled = metronome_enabled;
         }

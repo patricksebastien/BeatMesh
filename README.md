@@ -12,7 +12,8 @@ Built with PlatformIO and the ESP-IDF framework (espressif32), BeatMesh acts as 
 - **Ableton Link:** Synchronize seamlessly over WiFi.
 - **Ignore Stop:** Jam-proof mode. Stop messages from Link peers, MIDI in or CV in are refused; only BeatMesh itself can stop the clock.
 - **MIDI Metronome:** Clock-synced click on the MIDI outputs (note 72 on beat 1, 64 on beats 2-4, channel 1 or 10).
-- **Random MIDI (fun mode):** Random pentatonic notes on channels 1-6, random-walk CCs, and a simple four-on-the-floor drum pattern on channel 10, all locked to the clock.
+- **Tuner:** One long open-string note on MIDI channel 1, note on at the downbeat of every bar and retriggered at the next one, for tuning by ear. One button cycles through the six guitar strings (E2 A2 D3 G3 B3 E4).
+- **Random MIDI (debug mode):** Random pentatonic notes on channels 1-6, random-walk CCs, and a simple four-on-the-floor drum pattern on channel 10, all locked to the clock.
 - **OTA Firmware Updates:** Upload new firmware (`.bin`) directly from the web portal, no cable needed.
 - **Easy Soldering:** All through-hole components (except USB-C, see below*), beginner-friendly assembly.
 - **Easy to Print:** Two-piece 3D-printed case (top and bottom STL), no supports needed, held together with M3 screws.
